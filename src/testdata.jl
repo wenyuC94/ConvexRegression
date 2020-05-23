@@ -21,37 +21,26 @@ function generate_examples(func_type,n,d,SNR,random_state =42)
         end
     elseif func_type == "B"
         ######## Type B ########
-        ### phi(x) = norm(x,2)+x_1^2+x_2^2
-        for i in 1:n
-            f[i] = norm(x[i,:],2)+x[i,1]^2+x[i,2]^2;
-            xi[i,:] = x[i,:]/norm(x[i,:],2);
-            xi[i,1:2] += 2*x[i,1:2]
-        end        
+        ### phi(x) = norm(x,4)^4
+        for i in 1:ntrain
+            f[i] = norm(x[i,:],4)^4;
+            xi[i,:] = 4*x[i,:].^3;
+        end
     elseif func_type == "C"
         ######## Type C ########
-        ### phi(x) = norm(x[4:],Inf)+norm(x[i,1:3],2)^2
-        for i in 1:n
-            f[i] = 5*norm(x[i,4:end],Inf) + norm(x[i,1:3],2)^2 ;
-            xi[i,1:3] = 2*x[i,1:3];
-            tmp = abs.(x[i,4:end]).==norm(x[i,4:end],Inf);
-            xi[i,4:end] = 5*tmp/sum(tmp) .* sign.(x[i,4:end]);
-        end 
-    elseif func_type == "D"
-        ######## Type D ########
         ### phi(x) = max_j <a_j,x>
-        a = 2 * rand(d,3) - 1
-        for i in 1:n
-            f[i],j = findmax([a[:,j]'*x[i,:] for j = 1:3])
+        a = 2 * rand(d,2*d) - 1
+        for i in 1:ntrain
+            f[i],j = findmax([a[:,j]'*x[i,:] for j = 1:2*d])
             xi[i,:] = a[:,j]
         end
-    elseif func_type == "E"
-        ######## Type E ########
-        ### phi(x) = 5norm(x,Inf) + norm(x,2)^2
-        for i in 1:n
-            f[i] = 5*norm(x[i,:],Inf) + norm(x[i,:],2)^2;
-            xi[i,:] = 2*x[i,:];
-            tmp = abs.(x[i,:]).==norm(x[i,:],Inf);
-            xi[i,:] += 5*tmp/sum(tmp).* sign.(x[i,:]);
+    elseif func_type == "D"
+        ######## Type D ########
+        ### phi(x) =  <a,x>
+        a = 2*rand(d,1) - 1
+        for i in 1:ntrain
+            f[i] = (a'*x[i,:])[1,1]
+            xi[i,:] = a
         end
     end
                     

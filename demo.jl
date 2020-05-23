@@ -7,7 +7,7 @@ include("src/testdata.jl")
 #### specify problem
 n = 2000; 
 d = 2;
-func_type = "A"; # for piecewise maximum function type in the paper, use func_type = "D" (in paper that's data_type = B)
+func_type = "A"; # for piecewise maximum function type in the paper, use func_type = "C" (in paper that's data_type = B)
 logrho = -3;
 SNR = 10;
 
