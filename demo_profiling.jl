@@ -46,7 +46,8 @@ else
 end
      
 
-runtime = @elapsed phi,xi,lamb, W, I,J, Wlen,obj = active_set(Xmat, Y, rho; max_steps= max_steps,maxiter=maxiter,violTOL=violTOL, innerTOL=innerTOL, outerTOL=outerTOL, 
+runtime = @elapsed phi,xi,lamb, W, Wlen, all_objs,all_obj_times,Wlen_list,searching_times,pow_times,f_evals_list, L_list, optimization_starting_steps = 
+        active_set_profiling(Xmat, Y, rho; max_steps= max_steps,maxiter=maxiter,maxtime=maxtime,violTOL=violTOL, innerTOL=innerTOL, outerTOL=outerTOL, 
         verbose = verbose,random_state = random_state,LBFGS=LBFGS, LS =LS, WS=WS, inexact = inexact, block = 0, aug = ActiveSetAugmentation(rule,n,block,violTOL))
 
 if block == 0

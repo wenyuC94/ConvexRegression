@@ -22,11 +22,11 @@ LBFGS = false;
 rule = 4;
 LS = true;
 WS = false;
-inexact=true;
+inexact=false;
 
 xtrain, ytrain, xtest, ytest, xtest_bd, ytest_bd, xtest_int, ytest_int = generate_training_test_samples(func_type,ntrain,ntest,d,r,SNR,1)
 
-maxiter=500
+maxiter=1000
 maxtime = 1800
 verbose = 1
 block = 0
@@ -36,18 +36,15 @@ Xflat = mat_to_flat(Xmat,n,d);
 violTOL = 1.0e-4;
 innerTOL = 1.0e-6;
 outerTOL = 1.0e-4;
+dropzero = true
 
-if inexact == true
-    max_steps = 5
-    innerTOL = 1.0e-6
-else
-    max_steps = 3000
-    innerTOL = 1.0e-7
-end
-     
+params1 = AlgorithmParameters(inexact=true, violTOL=violTOL, outerTOL=outerTOL)
+params2 = AlgorithmParameters(inexact=inexact, violTOL=1.0e-8, outerTOL=outerTOL)
+aug1 = ActiveSetAugmentation(rule,n,block,params1.violTOL)
+aug2 = ActiveSetAugmentation(rule,n,block,params2.violTOL)
+runtime = @elapsed phi,xi,lamb, W, I,J, Wlen,obj = two_stage_active_set(Xmat,Y,rho; verbose = verbose,random_state=random_state, 
+    maxiter=maxiter, block=block, dropzero=dropzero,  params_list = [params1, params2], augs = [aug1, aug2]);
 
-runtime = @elapsed phi,xi,lamb, W, I,J, Wlen,obj = active_set(Xmat, Y, rho; max_steps= max_steps,maxiter=maxiter,violTOL=violTOL, innerTOL=innerTOL, outerTOL=outerTOL, 
-        verbose = verbose,random_state = random_state,LBFGS=LBFGS, LS =LS, WS=WS, inexact = inexact, block = 0, aug = ActiveSetAugmentation(rule,n,block,violTOL))
 
 if block == 0
     J,II,_= findnz(W)
@@ -81,4 +78,3 @@ rmse_bd = rmse(ypred_bd, ytest_bd)
 rsq_bd = rsquared(ypred_bd, ytest_bd)
 rmse_int = rmse(ypred_int, ytest_int)
 rsq_int = rsquared(ypred_int, ytest_int)
-

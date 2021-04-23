@@ -1,7 +1,7 @@
 # ConvexRegression
 Large-Scale Convex Regression
 
-Call `active_set` and `active_set_limited_memory` to get solutions to convex regression.
+See `demo.jl` and `demo-2stage.jl` for example.
 
 
 See [Paper]() for the choice of parameters.

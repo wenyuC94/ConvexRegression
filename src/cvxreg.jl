@@ -1,817 +1,568 @@
 include("toolbox.jl")
+include("solver.jl")
+include("augmentation.jl")
 
-function initial_active_set(Xmat,Y)
-    n = size(Xmat,1);
-    W = ifelse.(Y[1:n-1].>Y[2:n],[(i,i+1) for i in 1:n-1],[(i+1,i) for i in 1:n-1])
-    return W
+function warm_start(Xmat::Array{T,2}, Y::Array{T,1}, rho::T, n::Int64, d::Int64; n_partition=0, partition_size=0,max_steps=5, maxiter=50, violTOL=1.0e-3, innerTOL=1.0e-4,outerTOL=1.0e-5,block=0) where T<:AbstractFloat
+    Is = Array{Int64,1}(undef,0)
+    Js = Array{Int64,1}(undef,0)
+    prtt_len::Int64 = 0;
+    obj::Float64 = 0.;
+    lamb_vec = Array{eltype(Y),1}(undef, 0);
+    if partition_size != 0 && n_partition != 0
+        @assert partition_size*n_partition == n
+        m = partition_size
+    elseif partition_size !=0
+        m = partition_size
+    elseif n_partition != 0
+        m = cld(n, n_partition);
+    else
+        m = cld(n, 5);
+    end
+    partition = partition_n_by_m(n,m);
+    for prtt in partition
+        prtt_len = length(prtt);
+        _,_,lamb_sub, _, I_sub, J_sub, _ ,obj_sub = active_set(Xmat[prtt,:], Y[prtt], rho; max_steps=max_steps,maxiter=maxiter,violTOL=violTOL, 
+            innerTOL=innerTOL, outerTOL=outerTOL, verbose=0,LBFGS=true, WS=false, block=block, aug = ActiveSetAugmentation(2,prtt_len,block,violTOL))
+        append!(Is, prtt[I_sub[lamb_sub.nzval .!=0]]);
+        append!(Js, prtt[J_sub[lamb_sub.nzval .!=0]]);
+        append!(lamb_vec, lamb_sub[lamb_sub.!=0]);
+        obj += obj_sub;
+    end
+    
+    Wlen = length(lamb_vec);
+    if block == 0
+        W = sparse(Js, Is, fill(true, Wlen), n,n);
+        lamb = sparse(Js, Is, lamb_vec, n,n);
+    else
+        W = sparse(Is, Js, fill(true, Wlen), n,n);
+        lamb = sparse(Is, Js, lamb_vec, n,n);
+    end
+    return W, lamb, Wlen, obj, Is, Js;
 end
 
 
-
-function augmentation_rule1(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,block=0)
-    n,d = size(Xmat)
-    Wtmp = Array{Tuple{Int64,Int64},1}(n-1);
-    viol = zeros(n-1,1);
-    viol_flags = zeros(n-1,1);
-    Delta = Array{Tuple{Int64,Int64},1}(0);
-    P1 = 0;
-    p = Array{Int64,1}(P);
-    for i in 1:n
-        if block == 0
-            Wtmp = setdiff([(i,j) for j in setdiff(1:n,i)],W);
+function active_set(Xmat::Array{T,2}, Y::Array{T,1}, rho::T; 
+        max_steps= 5,maxiter=50,violTOL =1.0e-3, innerTOL=1.0e-4, outerTOL=1.0e-5, 
+        verbose = 1,random_state = 42,LBFGS=false, LS =true, WS=false, inexact = true, 
+        block = 0, aug = ActiveSetAugmentation(2,n,block,violTOL)) where {T<:AbstractFloat}
+    start = time()
+    if random_state != -1
+        Random.seed!(random_state);
+    end
+    n,d = size(Xmat);
+    Xflat = mat_to_flat(Xmat,n,d);
+    last_obj = 0.;
+    flag::Int = 0;
+    if ~WS
+        W = spzeros(Bool, n,n);
+        Wlen::Int64 = 0;
+        Wlen_prev::Int64 = 0;
+        lamb = spzeros(eltype(Y),n,n);
+        phi = copy(Y);
+        xi = zeros(eltype(Y),n*d);
+        obj = 0.;
+        if block ==0
+            J,I,_ = findnz(W)
         else
-            Wtmp = setdiff([(j,i) for j in setdiff(1:n,i)],W);
+            I,J,_ = findnz(W)
         end
-        viol = A_dot_s(Wtmp,phi)+B_dot_s(Xmat,Wtmp,xi);
-        viol_flags = viol.<-TOL;
-        P1 = min(sum(viol_flags),P);
-        if P1 == 0
-           continue
-        elseif P1 == 1
-           _,p = findmin(viol);
-            push!(Delta,Wtmp[p])
+    else
+        W, lamb, Wlen, obj, I, J = warm_start(Xmat, Y, rho, n, d; n_partition=5);
+        Wlen_prev = Wlen;
+        phi = zeros(eltype(Y), n);
+        xi = zeros(eltype(Y),n*d);
+        get_primal_solution!(phi,xi,Xflat,Y,rho,I,J, Wlen, lamb.nzval, n, d)
+    end
+    if (~LBFGS)&&LS 
+        L::Float64 = 0.;
+    end
+    if verbose >= 1
+        println("Optimization Started\n")
+    end
+    for k in 1:maxiter
+        if verbose >= 1
+            println("\nIteration:  ",k)
+            println("Wlen_prev:  ",Wlen_prev)
+        end
+        Wlen = aug(phi,xi,Xflat,Y,W,Wlen,lamb,n,d)
+        if Wlen > Wlen_prev
+            if block ==0
+                J,I,_ = findnz(W)
+            else
+                I,J,_ = findnz(W)
+            end
+        end
+        if Wlen - Wlen_prev <= 0.005*n
+            flag += 1
         else
-           p = sortperm(viol[:];alg=PartialQuickSort(P1))[1:P1]
-           append!(Delta,Wtmp[p])
+            flag = 0
+        end
+        Wlen_prev = Wlen;
+        if verbose >= 1
+            println("     Wlen:  ",Wlen)
+            println("     flag:  ",flag)
+        end 
+        if LBFGS == false
+            if LS == true
+                L,obj = cvxreg_qp_ineq_APG_ls(Xflat, Y, rho, I, J, Wlen, lamb, L, n, d, phi, xi; TOL=innerTOL, max_steps = max_steps)
+                println("        L:  ",L)
+            else
+                obj = cvxreg_qp_ineq_APG(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; TOL=innerTOL, max_steps = max_steps)
+            end
+        else
+            obj = cvxreg_qp_ineq_LBFGS(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; TOL=innerTOL, max_steps = max_steps)
+        end
+        if verbose >= 1
+            println("Objective:  ",obj)
+        end
+        if k > 1&& (obj - last_obj > -outerTOL || obj > last_obj * (1+outerTOL)) && flag >= 5
+            break
+        else
+            last_obj = obj;
         end
     end
-    return Delta
+    runtime = time() - start
+    if verbose >= 1
+        println("\nConvex Regression finishes in ",runtime," s.")
+    end
+    return phi,xi,lamb, W, I,J, Wlen,obj
 end
 
-function augmentation_rule1_heuristic(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,J,Wcheck,Wchecklen,is_sort_iter,block=0)
-    n,d = size(Xmat)
-    p = Array{Int64,1}(P);
-    Wtmp = Array{Tuple{Int64,Int64},1}(J);
-    viol = zeros(J,1);
-    Delta = Array{Tuple{Int64,Int64},1}(0);
-    P1 = 0;
-    p = Array{Int64,1}(P);
-    flag = 0;
-    for i in 1:n
-        if is_sort_iter == false
-            if Wchecklen[i] != 0 
-                Wtmp = setdiff(Wcheck[i],W);
-                if length(Wtmp) == 0
-                    flag += 1;
-                    continue
-                end
-                viol = A_dot_s(Wtmp,phi)+B_dot_s(Xmat,Wtmp,xi);
-                viol_flags = viol.<-TOL;
-                P1 = min(sum(viol_flags),P);
-                if P1 == 0
-                   continue
-                elseif P1 == 1
-                   _,p = findmin(viol);
-                    push!(Delta,Wtmp[p])
+
+function active_set_profiling(Xmat::Array{T,2}, Y::Array{T,1}, rho::T; 
+        max_steps= 5,maxiter=50,maxtime=10800,violTOL =1.0e-3, innerTOL=1.0e-4, outerTOL=1.0e-5, 
+        verbose = 1,random_state = 42,LBFGS=false, LS =true, WS=false, inexact = true, 
+        block = 0, aug = ActiveSetAugmentation(2,n,block,violTOL)) where {T<:AbstractFloat}
+    start = time()
+    cur_time = @elapsed begin
+        if random_state != -1
+            Random.seed!(random_state);
+        end
+        n,d = size(Xmat);
+        Xflat =  mat_to_flat(Xmat,n,d);
+        last_obj = 0.;
+        flag::Int = 0;
+        if ~WS
+            W = spzeros(Bool, n,n);
+            Wlen::Int64 = 0;
+            Wlen_prev::Int64 = 0;
+            lamb = spzeros(eltype(Y),n,n);
+            phi = copy(Y);
+            xi = zeros(eltype(Y),n*d);
+            obj = 0.;
+            if block ==0
+                J,I,_ = findnz(W)
+            else
+                I,J,_ = findnz(W)
+            end
+        else
+            W, lamb, Wlen, obj, I, J = warm_start(Xmat, Y, rho, n, d; n_partition=5);
+            Wlen_prev = Wlen;
+            phi = zeros(eltype(Y), n);
+            xi = zeros(eltype(Y),n*d);
+            get_primal_solution!(phi,xi,Xflat,Y,rho,I,J, Wlen, lamb.nzval, n, d)
+        end
+        if (~LBFGS)&&LS 
+            L::Float64 = 0.;
+        end
+    end
+    searching_times = Array{Float64}([]) # len = # outer 
+    all_objs = Array{Float64}([]) # len = # inner + outer
+    all_obj_times = Array{Float64}([]) # len = # inner + outer
+    Wlen_list = Array{Int64}([]) # len = # inner + 1
+    if LBFGS
+        pow_times = nothing
+        L_list = nothing
+        f_evals_list = Array{Int64}([]) # len = # outer
+    elseif ~LS
+        pow_times = Array{Float64}([]) # len = # outer
+        f_evals_list = nothing
+        L_list = Array{Float64}([]) # len = # outer
+    elseif LS
+        pow_times = nothing
+        L_list = Array{Float64}([]) # len = # outer
+        f_evals_list = Array{Int64}([]) # len = # outer
+    end
+
+    optimization_starting_steps = Array{Int64}([]) # len = # outer 
+    searching_time ::Float64 = 0;
+    append!(all_objs, last_obj)
+    append!(all_obj_times,cur_time)
+    append!(Wlen_list, Wlen)
+    solvetime::Float64 = 0;
+    if verbose >= 1
+        println("Optimization Started\n")
+    end
+    for k in 1:maxiter
+        if k >= 2 && searching_times[end]+cur_time >= maxtime
+            println("early stopping in searching due to time limit")
+            break
+        end
+        if verbose >= 1
+            println("\nIteration:  ", k)
+            println("Wlen_prev:  ",Wlen_prev)
+        end
+        searching_time = @elapsed Wlen = aug(phi,xi,Xflat,Y,W,Wlen,lamb,n,d)
+        cur_time += searching_time
+        append!(searching_times,searching_time)
+        append!(Wlen_list, Wlen)
+        if Wlen > Wlen_prev
+            if block ==0
+                J,I,_ = findnz(W)
+            else
+                I,J,_ = findnz(W)
+            end
+        end
+        if Wlen - Wlen_prev <= 0.005*n
+            flag += 1
+        else
+            flag = 0
+        end
+        Wlen_prev = Wlen;
+        if verbose >= 1
+            println("     Wlen:  ",Wlen)
+            println("     flag:  ",flag)
+        end 
+        append!(optimization_starting_steps, length(all_objs)+1)
+        if LBFGS == false
+            if LS == true
+                solvetime = @elapsed status, L, obj, times, objs, f_evals, Ls, _ = cvxreg_qp_ineq_APG_ls_profiling(Xflat, Y, rho, I, J, Wlen, lamb, L, n, d, phi, xi; TOL=innerTOL, max_steps = max_steps, 
+                    start_time = cur_time, end_time = maxtime)
+                append!(f_evals_list, sum(f_evals));
+                append!(L_list, L);
+                println("        L:  ",L)
+            else
+                solvetime = @elapsed status, obj, times, objs, pow_time, L, _ = cvxreg_qp_ineq_APG_profiling(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; TOL=innerTOL, max_steps = max_steps,
+                    start_time = cur_time, end_time = maxtime)
+                append!(pow_times, pow_time)
+                append!(L_list, L)
+                println("        L:  ",L)
+            end
+        else
+            solvetime = @elapsed obj, times, objs, f_evals, _ = cvxreg_qp_ineq_LBFGS_profiling(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; TOL=innerTOL, max_steps = max_steps)
+            append!(f_evals_list, sum(f_evals)) 
+            status= 0
+        end
+        append!(all_objs,objs)
+        append!(all_obj_times,cur_time.+times)
+        cur_time += solvetime;
+        if verbose >= 1
+            println("Objective:  ",obj)
+            println("     Time:  ",all_obj_times[end])
+        end
+        if status == -1
+            break
+        end
+        if cur_time >= maxtime
+            println("early stopping after optimization due to time limit")
+            break
+        end
+        if k > 1&& (obj - last_obj > -outerTOL || obj > last_obj * (1+outerTOL)) && flag >= 5
+            break
+        else
+            last_obj = obj;
+        end
+    end
+    runtime = time() - start
+    if verbose >= 1
+        println("\nConvex Regression finishes in ",runtime," s.")
+    end
+    return phi,xi,lamb, W, Wlen, all_objs,all_obj_times,Wlen_list,searching_times,pow_times,f_evals_list, L_list, optimization_starting_steps
+end
+
+
+struct AlgorithmParameters
+    LBFGS::Bool;
+    LS::Bool;
+    WS::Bool;
+    inexact::Bool;
+    max_steps::Int64;
+    violTOL::Float64;
+    innerTOL::Float64;
+    outerTOL::Float64;
+    function AlgorithmParameters(;LBFGS=false,LS=true,WS=false,inexact=true,max_steps=-1,violTOL=1.0e-3,innerTOL=-1.,outerTOL=1.0e-5)
+        if inexact
+            max_steps = (max_steps == -1) ? 5 : max_steps
+            innerTOL = (innerTOL==-1.0) ? 1e-6 : innerTOL
+        else
+            max_steps = (max_steps == -1) ? 3000 : max_steps
+            innerTOL = (innerTOL==-1.0) ? 1e-7 : innerTOL
+        end
+        new(LBFGS, LS, WS, inexact, max_steps, violTOL, innerTOL, outerTOL);
+    end
+end
+
+
+function two_stage_active_set(Xmat::Array{T,2}, Y::Array{T,1}, rho::T; verbose = 1, random_state = 42, maxiter = 50, block = 0, dropzero = true,
+        params_list::Array{AlgorithmParameters,1}, augs::Array{ActiveSetAugmentation,1}) where {T<:AbstractFloat}
+    start = time()
+    if random_state != -1
+        Random.seed!(random_state);
+    end
+    n,d = size(Xmat);
+    Xflat = mat_to_flat(Xmat,n,d);
+    last_obj = 0.;
+    flag::Int = 0;
+    WS = params_list[1].WS
+    LS = params_list[1].LS
+    LBFGS = params_list[1].LBFGS
+    if ~WS
+        W = spzeros(Bool, n,n);
+        Wlen::Int64 = 0;
+        Wlen_prev::Int64 = 0;
+        lamb = spzeros(eltype(Y),n,n);
+        phi = copy(Y);
+        xi = zeros(eltype(Y),n*d);
+        obj = 0.;
+        if block ==0
+            J,I,_ = findnz(W)
+        else
+            I,J,_ = findnz(W)
+        end
+    else
+        W, lamb, Wlen, obj, I, J = warm_start(Xmat, Y, rho, n, d; n_partition=5);
+        Wlen_prev = Wlen;
+        phi = zeros(eltype(Y), n);
+        xi = zeros(eltype(Y),n*d);
+        get_primal_solution!(phi,xi,Xflat,Y,rho,I,J, Wlen, lamb.nzval, n, d)
+    end
+    if (~LBFGS)&&LS 
+        L::Float64 = 0.;
+    end
+    stage::Int64 = 1;
+    if verbose >= 1
+        println("Optimization Started\n")
+    end
+    for k in 1:maxiter
+        if verbose >= 1
+            println("\nIteration:  ", k)
+            println("    Stage:  ", stage)
+            println("Wlen_prev:  ",Wlen_prev)
+        end
+        Wlen = augs[stage](phi,xi,Xflat,Y,W,Wlen,lamb,n,d)
+        if Wlen > Wlen_prev
+            if block ==0
+                J,I,_ = findnz(W)
+            else
+                I,J,_ = findnz(W)
+            end
+        end
+        if Wlen - Wlen_prev <= 0.005*n
+            flag += 1
+        elseif stage == 1
+            flag = 0
+        end
+        Wlen_prev = Wlen;
+        if verbose >= 1
+            println("     Wlen:  ",Wlen)
+            println("     flag:  ",flag)
+        end 
+        if LBFGS == false
+            if LS == true
+                L,obj = cvxreg_qp_ineq_APG_ls(Xflat, Y, rho, I, J, Wlen, lamb, L, n, d, phi, xi; TOL=params_list[stage].innerTOL, max_steps = params_list[stage].max_steps)
+                println("        L:  ",L)
+            else
+                obj = cvxreg_qp_ineq_APG(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; TOL=params_list[stage].innerTOL, max_steps = params_list[stage].max_steps)
+            end
+        else
+            obj = cvxreg_qp_ineq_LBFGS(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; TOL=params_list[stage].innerTOL, max_steps = params_list[stage].max_steps)
+        end
+        if verbose >= 1
+            println("Objective:  ",obj)
+        end
+        if stage == 1 && k > 1 && flag >= 5
+            flag = 0;
+            stage = 2;
+            if dropzero
+                lamb = dropzeros(lamb)
+                if block ==0
+                    J,I,_ = findnz(lamb)
                 else
-                   p = sortperm(viol[:];alg=PartialQuickSort(P1))[1:P1]
-                   append!(Delta,Wtmp[p])
+                    I,J,_ = findnz(lamb)
                 end
-            else
-                flag += 1;
+                Wlen = length(lamb.nzval)
+                Wlen_prev = Wlen
+                W = sparse(J,I,fill(true,Wlen),n,n)
             end
-        else
-            if block == 0
-                Wtmp = setdiff([(i,j) for j in setdiff(1:n,i)],W);
-            else
-                Wtmp = setdiff([(j,i) for j in setdiff(1:n,i)],W);
-            end 
-            viol = A_dot_s(Wtmp,phi)+B_dot_s(Xmat,Wtmp,xi);
-            ntmp = min(length(viol),J)
-            p = sortperm(viol[:];alg=PartialQuickSort(ntmp))[1:ntmp]
-            Wtmp = Wtmp[p];
-            viol = viol[p];
-            if viol[1] >= -TOL
-                Wchecklen[i] = 0;
-                flag += 1;
-            else
-                viol_flags = viol.<-TOL
-                Wchecklen[i] = sum(viol_flags)
-                Wcheck[i] = Wtmp[viol_flags]
-                append!(Delta,Wcheck[i][1:min(P,Int(Wchecklen[i]))])
-            end
-        end
-    end
-    if (flag == n)
-        if is_sort_iter == false
-            return augmentation_rule1_heuristic(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,J,Wcheck,Wchecklen,true,block)
-        else
-            return Delta
-        end
-    else
-        return Delta
-    end
-end
-
-
-function augmentation_rule2(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,K)
-    n,d = size(Xmat);
-    all_i = rand(1:n,K)
-    all_j = rand(1:n,K)
-    Delta = [(i,j) for (i,j) in zip(all_i,all_j) if i != j ]
-    Delta = unique(setdiff(Delta,W[1:Wlen]))
-    viol = A_dot_s(Delta, phi) + B_dot_s(Xmat, Delta,xi);
-    Delta = Delta[viol[:].<-TOL];
-    return Delta
-end
-
-function augmentation_rule3(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,block=0)
-    n,d = size(Xmat);
-    if block ==0
-        Delta = [(i,j) for i in 1:n for j in rand(setdiff(1:n,i),P)]
-    else
-        Delta = [(j,i) for i in 1:n for j in rand(setdiff(1:n,i),P)]
-    end
-    Delta = unique(setdiff(Delta,W[1:Wlen]))
-    viol = A_dot_s(Delta, phi) + B_dot_s(Xmat, Delta,xi);
-    Delta = Delta[viol[:].<-TOL];
-    return Delta
-end
-
-function augmentation_rule4(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,M,K)
-    n,d = size(Xmat);
-    all_i = rand(1:n,M);
-    Delta = [(i,rand(setdiff(1:n,i))) for i in all_i];
-    Delta = unique(setdiff(Delta,W[1:Wlen]))
-    viol = A_dot_s(Delta,phi)+B_dot_s(Xmat,Delta,xi);
-    viol_flags = viol.<-TOL;
-    P1 = min(sum(viol_flags),K);
-    if P1 == 0
-        return Array{Tuple{Int64,Int64},1}(0);
-    elseif P1 == 1
-        _,p = findmin(viol)
-        return [Delta[p]]
-    else
-        p = sortperm(viol[:];alg=PartialQuickSort(P1))[1:P1]
-        return Delta[p]
-    end
-end
-
-function augmentation_rule5(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,G,P,block=0)
-    n,d = size(Xmat)
-    Wtmp = Array{Tuple{Int64,Int64},1}(n-1);
-    viol = zeros(n-1,1);
-    Delta = Array{Tuple{Int64,Int64},1}(0);
-    P1 = 0;
-    for i in rand(1:n,G)
-        if block == 0
-            Wtmp = setdiff([(i,j) for j in setdiff(1:n,i)],W);
-        else
-            Wtmp = setdiff([(j,i) for j in setdiff(1:n,i)],W);
-        end
-        viol = A_dot_s(Wtmp,phi)+B_dot_s(Xmat,Wtmp,xi);
-        viol_flags = viol.<-TOL;
-        P1 = min(sum(viol_flags),P);
-        if P1 == 0
-           continue
-        elseif P1 == 1
-           _,p = findmin(viol);
-            push!(Delta,Wtmp[p])
-        else
-           p = sortperm(viol[:];alg=PartialQuickSort(P1))[1:P1]
-           append!(Delta,Wtmp[p])
-        end
-    end
-    return Delta
-end
-
-function active_set_augmentation(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,rule,P,M,K,G,block,J,Wcheck,Wchecklen)
-    if rule == 1
-        return augmentation_rule1(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,block)
-    elseif rule == -1
-        return augmentation_rule1_heuristic(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,J,Wcheck,Wchecklen,false,block)
-    elseif rule == 2
-        return augmentation_rule2(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,K)
-    elseif rule == 3
-        return augmentation_rule3(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,P,block)
-    elseif rule == 4
-        return augmentation_rule4(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,M,K)
-    elseif rule == 5
-        return augmentation_rule5(Xmat,Y,W,Wlen,phi,xi,lamb,TOL,G,P,block)
-    elseif rule == 0
-        return initial_active_set(Xmat,Y)
-    end
-end
-
-function warm_start(Xmat,Y,rho,partition_method,max_steps = 100,maxiter=20,violTOL=1.0e-2,innerTOL=1.0e-3,outerTOL = 1.0e-3,K=100,block=0)
-    n,d = size(Xmat);
-    W = Array{Tuple{Int64,Int64},1}(n*(n-1));
-    lamb = zeros(n*(n-1));
-    Wlen = 0;
-    Wlen = 0;
-    obj = 0;
-    if partition_method == "thousand"
-        partition = partition_n_by_m(n,1000);
-        for prtt in partition
-            _,_,lambtmp, Wtmp,Wlentmp,objtmp = active_set(Xmat[prtt,:], Y[prtt], rho, 5,50,1.0e-3, 1.0e-4, 1.0e-5, 0,-1,true, false, true,2,"five",1,0,K,0,block)
-            obj+= objtmp;
-            Wlennew = Wlen + sum(lambtmp.!=0);
-            W[Wlen+1:Wlennew] = [(prtt[i],prtt[j]) for (i,j) in Wtmp[(lambtmp.!=0)[:]]];
-            lamb[Wlen+1:Wlennew] = lambtmp[lambtmp.!=0];
-            Wlen = Wlennew;
-        end
-        return W, lamb, Wlen,obj;
-    end
-    num_dict = Dict("five"=>5,"ten"=>10,"fifteen"=>15,"twenty"=>20,"fifty"=>50)
-    if partition_method in keys(num_dict)
-        m = cld(n,num_dict[partition_method]);
-        partition = partition_n_by_m(n,m);
-        for prtt in partition
-            _,_,lambtmp, Wtmp,Wlentmp,objtmp = active_set(Xmat[prtt,:], Y[prtt], rho, 5,50,1.0e-3, 1.0e-4, 1.0e-5, 0,-1,true, false, true,2,"five",1,0,K,0,block)
-            obj+= objtmp;
-            Wlennew = Wlen + sum(lambtmp.!=0);
-            W[Wlen+1:Wlennew] = [(prtt[i],prtt[j]) for (i,j) in Wtmp[(lambtmp.!=0)[:]]];
-            lamb[Wlen+1:Wlennew] = lambtmp[lambtmp.!=0];
-            Wlen = Wlennew;
-        end
-        return W, lamb, Wlen,obj;
-    end
-end
-
-
-function warm_start_limited_memory(Xmat,Y,rho,partition_method,max_steps = 100,maxiter=20,violTOL=1.0e-2,innerTOL=1.0e-3,outerTOL = 1.0e-3,K=100,block=0)
-    n,d = size(Xmat);
-    W = Array{Tuple{Int64,Int64},1}(0);
-    lamb = zeros(0);
-    Wlen = 0;
-    obj = 0;
-    if partition_method == "thousand"
-        partition = partition_n_by_m(n,1000);
-        for prtt in partition
-            _,_,lambtmp, Wtmp,Wlentmp,objtmp = active_set_limited_memory(Xmat[prtt,:], Y[prtt], rho, 5,50,1.0e-3, 1.0e-4, 1.0e-5, 0,-1,true, false, true,2,"five",1,0,K,0,block)
-            obj+= objtmp;
-            Wtmp = [(prtt[i],prtt[j]) for (i,j) in Wtmp[(lambtmp.!=0)[:]]];
-            lambtmp = lambtmp[lambtmp.!=0];
-            append!(W,Wtmp);
-            append!(lamb,lambtmp);
-            Wlen += length(Wtmp);
-        end
-        return W, lamb, Wlen,obj;
-    end
-    num_dict = Dict("five"=>5,"ten"=>10,"fifteen"=>15,"twenty"=>20,"fifty"=>50)
-    if partition_method in keys(num_dict)
-        m = cld(n,num_dict[partition_method]);
-        partition = partition_n_by_m(n,m);
-        for prtt in partition
-            _,_,lambtmp, Wtmp,Wlentmp,objtmp = active_set_limited_memory(Xmat[prtt,:], Y[prtt], rho, 5,50,1.0e-3, 1.0e-4, 1.0e-5, 0,-1,true, false, true,2,"five",1,0,K,0,block)
-            obj+= objtmp;
-            Wtmp = [(prtt[i],prtt[j]) for (i,j) in Wtmp[(lambtmp.!=0)[:]]];
-            lambtmp = lambtmp[lambtmp.!=0];
-            append!(W,Wtmp);
-            append!(lamb,lambtmp);
-            Wlen += length(Wtmp);
-        end
-        return W, lamb, Wlen,obj;
-    end
-end
-
-
-function active_set_timing_limited_memory(Xmat, Y, rho, max_steps= 5,maxiter=50,violTOL =1.0e-3, innerTOL=1.0e-4, outerTOL=1.0e-5, verbose = 1,random_state = 42,maxtime = 10800,LS =true, WS=false,inexact = true,rule=2,warm_start_partition="five",P=1,M=0,K=100,G=0,block=0,heuristics=false,J=0)
-    tic();
-    if random_state != -1
-        srand(random_state);
-    end
-    if WS == false
-        cur_time = @elapsed begin
-            searching_times = Array{Float64}([])
-            all_obj_times = Array{Float64}([])
-            pow_times = Array{Float64}([])
-            optimization_starting_times = Array{Int}([])
-            n,d = size(Xmat);
-            W = Array{Tuple{Int64,Int64},1}(0);
-            Wlen = 0;
-            lamb = zeros(0,1);
-            phi = Y;
-            xi = zeros(n*d,1);
-            k = 0;
-            flag = 0;
-            all_objs = Array{Float64}([])
-            if heuristics == true
-                rule = -1
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-                Wchecklen = Array{Int64,1}(n)
-                for i in 1:n
-                    Wchecklen[i] = 0;
-                    Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-                end
-            else
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-                Wchecklen = Array{Int64,1}(0)
-            end
-        end
-        initialize_time = cur_time;
-        searching_time = 0;
-    else
-        cur_time = @elapsed begin
-            searching_times = Array{Float64}([])
-            all_obj_times = Array{Float64}([])
-            pow_times = Array{Float64}([])
-            optimization_starting_times = Array{Int}([])
-            n,d = size(Xmat);
-            W,lamb,Wlen,last_obj = warm_start_limited_memory(Xmat,Y,rho,warm_start_partition,100,20,1.0e-2,1.0e-3,1.0e-3,100,block);
-            sorted_idx = sortperm(W);
-            W = W[sorted_idx];
-            lamb = lamb[sorted_idx];
-            phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-            all_objs = Array{Float64}([])
-            L = 0;
-            if heuristics == true
-                rule = -1
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-                Wchecklen = Array{Int64,1}(n)
-                for i in 1:n
-                    Wchecklen[i] = 0;
-                    Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-                end
-            else
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-                Wchecklen = Array{Int64,1}(0)
-            end
-        end
-        initialize_time = cur_time;
-        searching_time = 0;
-        append!(all_objs, last_obj)
-        append!(all_obj_times,cur_time)
-    end
-    if LS == true
-        L = 0
-    end
-    
-    for k in 1:maxiter
-        searching_time = @elapsed begin
-            Delta = active_set_augmentation(Xmat,Y,W,Wlen,phi,xi,lamb,violTOL,rule,P,M,K,G,block,J,Wcheck,Wchecklen);
-            Delta_len = length(Delta);
-            if verbose >= 1
-                println("Iteration:")
-                println(k);
-            end
-            if Delta_len != 0
-                append!(W,Delta)
-                lamb = vcat(lamb,zeros(Delta_len,1))
-                sorted_idx = sortperm(W);
-                W = W[sorted_idx];
-                lamb = lamb[sorted_idx];
-                flag = 0
-                if verbose >= 1
-                    println(Wlen)
-                end
-                Wlen = Wlen + Delta_len
-                if verbose >= 1
-                    println(Wlen)
-                end
+        elseif stage == 2 && (k > 1&& (obj - last_obj > -params_list[stage].outerTOL || obj > last_obj * (1+params_list[stage].outerTOL)))
+            if flag >= 10
+                break
             else
                 flag += 1
-                if verbose >= 1
-                    println(Wlen)
-                    println(Wlen)
-                end
             end
         end
+        last_obj = obj;
+    end
+    runtime = time() - start
+    if verbose >= 1
+        println("\nConvex Regression finishes in ",runtime," s.")
+    end
+    return phi,xi,lamb, W, I,J, Wlen,obj
+end
+
+
+function two_stage_active_set_profiling(Xmat::Array{T,2}, Y::Array{T,1}, rho::T; verbose = 1, random_state = 42, maxiter = 50, maxtime = 10800, block = 0, dropzero = true,
+        params_list::Array{AlgorithmParameters,1}, augs::Array{ActiveSetAugmentation,1}) where {T<:AbstractFloat}
+    start = time()
+    cur_time = @elapsed begin
+        if random_state != -1
+            Random.seed!(random_state);
+        end
+        n,d = size(Xmat);
+        Xflat = mat_to_flat(Xmat,n,d);
+        last_obj = 0.;
+        flag::Int = 0;
+        WS = params_list[1].WS
+        LS = params_list[1].LS
+        LBFGS = params_list[1].LBFGS
+        if ~WS
+            W = spzeros(Bool, n,n);
+            Wlen::Int64 = 0;
+            Wlen_prev::Int64 = 0;
+            lamb = spzeros(eltype(Y),n,n);
+            phi = copy(Y);
+            xi = zeros(eltype(Y),n*d);
+            obj = 0.;
+            if block ==0
+                J,I,_ = findnz(W)
+            else
+                I,J,_ = findnz(W)
+            end
+        else
+            W, lamb, Wlen, obj, I, J = warm_start(Xmat, Y, rho, n, d; n_partition=5);
+            Wlen_prev = Wlen;
+            phi = zeros(eltype(Y), n);
+            xi = zeros(eltype(Y),n*d);
+            get_primal_solution!(phi,xi,Xflat,Y,rho,I,J, Wlen, lamb.nzval, n, d)
+        end
+        if (~LBFGS)&&LS 
+            L::Float64 = 0.;
+        end
+        stage::Int64 = 1;
+    end
+    stages = Array{Int64}([]) # len = # outer
+    searching_times = Array{Float64}([]) # len = # outer 
+    all_objs = Array{Float64}([]) # len = # inner + outer
+    all_obj_times = Array{Float64}([]) # len = # inner + outer
+    Wlen_list = Array{Int64}([]) # len = # inner + 1
+    if LBFGS
+        pow_times = nothing
+        L_list = nothing
+        f_evals_list = Array{Int64}([]) # len = # outer
+    elseif ~LS
+        pow_times = Array{Float64}([]) # len = # outer
+        f_evals_list = nothing
+        L_list = Array{Float64}([]) # len = # outer
+    elseif LS
+        pow_times = nothing
+        L_list = Array{Float64}([]) # len = # outer
+        f_evals_list = Array{Int64}([]) # len = # outer
+    end
+
+    optimization_starting_steps = Array{Int64}([]) # len = # outer 
+    searching_time ::Float64 = 0;
+    append!(all_objs, last_obj)
+    append!(all_obj_times,cur_time)
+    append!(Wlen_list, Wlen)
+    solvetime::Float64 = 0;
+    if verbose >= 1
+        println("Optimization Started\n")
+    end
+    for k in 1:maxiter
+        if k >= 2 && searching_times[end]+cur_time >= maxtime
+            println("early stopping in searching due to time limit")
+            break
+        end
+        append!(stages, stage)
+        if verbose >= 1
+            println("\nIteration:  ", k)
+            println("    Stage:  ", stage)
+            println("Wlen_prev:  ",Wlen_prev)
+        end
+        searching_time = @elapsed Wlen = augs[stage](phi,xi,Xflat,Y,W,Wlen,lamb,n,d)
         cur_time += searching_time
         append!(searching_times,searching_time)
-        tmp_steps = max_steps
-        if inexact == true
-            if  k == maxiter
-                tmp_steps = 100
+        append!(Wlen_list, Wlen)
+        if Wlen > Wlen_prev
+            if block ==0
+                J,I,_ = findnz(W)
             else
-                tmp_steps = max_steps
+                I,J,_ = findnz(W)
             end
         end
-        append!(optimization_starting_times, length(all_objs)+1)
-        if LS == true
-            solvetime = @elapsed objs,times,pow_time,phi,xi,lamb,L = cvxreg_qp_ineq_APG_ls_timing(Xmat, Y, rho, W, Wlen, lamb, tmp_steps, L,innerTOL)
-        else
-            solvetime = @elapsed objs,times,pow_time,phi,xi,lamb = cvxreg_qp_ineq_APG_timing(Xmat, Y, rho, W, Wlen, lamb, tmp_steps, innerTOL)
-        end
-        if cur_time + solvetime >= maxtime
-            append!(all_objs,objs)
-            append!(all_obj_times,cur_time+times)
-            append!(pow_times, pow_time)
-            if verbose >= 1
-                println(objs[end])
-                println(all_obj_times[end])
-            end
-            break
-        end
-        if k > 1
-            last_obj = all_objs[end];
-        end
-        if k > 1&& objs[end] - last_obj > -outerTOL*0.1 && objs[end] > last_obj * (1+outerTOL) && flag >= 5
-            append!(all_objs,objs)
-            append!(all_obj_times,cur_time+times)
-            append!(pow_times, pow_time)
-            if verbose >= 1
-                println(objs[end])
-                println(all_obj_times[end])
-            end
-            cur_time += solvetime
-            break
-        else
-            append!(all_objs,objs)
-            append!(all_obj_times,cur_time+times)
-            append!(pow_times, pow_time)
-            if verbose >= 1
-                println(objs[end])
-                println(all_obj_times[end])
-            end
-            cur_time += solvetime
-        end
-    end
-    solvetime = toq();
-    if verbose >= 1
-        println(solvetime)
-    end
-    return all_objs,all_obj_times,initialize_time,searching_times,pow_times, optimization_starting_times,phi,xi,lamb, W,Wlen
-end
-
-
-function active_set_limited_memory(Xmat, Y, rho, max_steps= 5,maxiter=50,violTOL =1.0e-3, innerTOL=1.0e-4, outerTOL=1.0e-5, verbose = 1,random_state = 42,LS =true, WS=false,inexact = true,rule=1,warm_start_partition="five",P=1,M=0,K=100,G=0,block=0,heuristics=false,J=0)
-    tic();
-    if random_state != -1
-        srand(random_state);
-    end
-    if WS == false
-        n,d = size(Xmat);
-        tic();
-        W = Array{Tuple{Int64,Int64},1}(0);
-        Wlen = 0;
-        lamb = zeros(0,1);
-        phi = Y;
-        xi = zeros(n*d,1);
-        flag = 0;
-        obj = 0;
-        last_obj = 0;
-        if heuristics == true
-            rule = -1
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-            Wchecklen = Array{Int64,1}(n)
-            for i in 1:n
-                Wchecklen[i] = 0;
-                Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-            end
-        else
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-            Wchecklen = Array{Int64,1}(0)
-        end
-    else
-        n,d = size(Xmat);
-        W,lamb,Wlen,last_obj = warm_start_limited_memory(Xmat,Y,rho,warm_start_partition,100,20,1.0e-2,1.0e-3,1.0e-3,100,block);
-        sorted_idx = sortperm(W);
-        W = W[sorted_idx];
-        lamb = lamb[sorted_idx];
-        phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-        obj = 0
-        L = 0;
-        if heuristics == true
-            rule = -1
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-            Wchecklen = Array{Int64,1}(n)
-            for i in 1:n
-                Wchecklen[i] = 0;
-                Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-            end
-        else
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-            Wchecklen = Array{Int64,1}(0)
-        end
-    end
-    if LS == true
-        L = 0
-    end
-    
-    for k in 1:maxiter
-        Delta = active_set_augmentation(Xmat,Y,W,Wlen,phi,xi,lamb,violTOL,rule,P,M,K,G,block,J,Wcheck,Wchecklen);
-        Delta_len = length(Delta);
-        if verbose >= 1
-            println("Iteration:")
-            println(k);
-        end
-        if Delta_len != 0
-            append!(W,Delta)
-            lamb = vcat(lamb,zeros(Delta_len,1))
-            sorted_idx = sortperm(W);
-            W = W[sorted_idx];
-            lamb = lamb[sorted_idx];
-            flag = 0
-            if verbose >= 1
-                println(Wlen)
-            end
-            Wlen = Wlen + Delta_len
-            if verbose >= 1
-                println(Wlen)
-            end
-        else
+        if Wlen - Wlen_prev <= 0.005*n
             flag += 1
-            if verbose >= 1
-                println(Wlen)
-                println(Wlen)
-            end
+        elseif stage == 1
+            flag = 0
         end
-        tmp_steps = max_steps
-        if inexact == true
-            if  k == maxiter
-                tmp_steps = 100
+        Wlen_prev = Wlen;
+        if verbose >= 1
+            println("     Wlen:  ",Wlen)
+            println("     flag:  ",flag)
+        end 
+        append!(optimization_starting_steps, length(all_objs)+1)
+        if LBFGS == false
+            if LS == true
+                solvetime = @elapsed status, L, obj, times, objs, f_evals, Ls, _ = cvxreg_qp_ineq_APG_ls_profiling(Xflat, Y, rho, I, J, Wlen, lamb, L, n, d, phi, xi; 
+                    TOL=params_list[stage].innerTOL, max_steps = params_list[stage].max_steps, start_time = cur_time, end_time = maxtime)
+                append!(f_evals_list, sum(f_evals));
+                append!(L_list, L);
+                println("        L:  ",L)
             else
-                tmp_steps = max_steps
+                solvetime = @elapsed status, obj, times, objs, pow_time, L, _ = cvxreg_qp_ineq_APG_profiling(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; 
+                    TOL=params_list[stage].innerTOL, max_steps = params_list[stage].max_steps,  start_time = cur_time, end_time = maxtime)
+                append!(pow_times, pow_time)
+                append!(L_list, L)
+                println("        L:  ",L)
             end
-        end
-        if LS == true
-            phi,xi,lamb,L,obj = cvxreg_qp_ineq_APG_ls(Xmat, Y, rho, W, Wlen, lamb, tmp_steps, L,innerTOL)
         else
-            phi,xi,lamb,obj = cvxreg_qp_ineq_APG(Xmat, Y, rho, W, Wlen, lamb, max_steps, innerTOL)
+            solvetime = @elapsed obj, times, objs, f_evals, _ = cvxreg_qp_ineq_LBFGS_profiling(Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi, xi; 
+                TOL=params_list[stage].innerTOL, max_steps = params_list[stage].max_steps)
+            append!(f_evals_list, sum(f_evals))
+            status = 0;
         end
-        if k > 1&& obj - last_obj > -outerTOL*0.1 && obj > last_obj * (1+outerTOL) && flag >= 5
-            if verbose >= 1
-                println(obj)
-            end
+        append!(all_objs,objs)
+        append!(all_obj_times,cur_time.+times)
+        cur_time += solvetime;
+        if verbose >= 1
+            println("Objective:  ",obj)
+            println("     Time:  ",all_obj_times[end])
+        end
+        if status == -1
             break
-        else
-            if verbose >= 1
-                println(obj)
-            end
-            last_obj = obj;
         end
-    end
-    solvetime = toq();
-    if verbose >= 1
-        println(solvetime)
-    end
-    return phi,xi,lamb, W,Wlen,obj
-end
-
-
-function active_set_timing(Xmat, Y, rho, max_steps= 5,maxiter=50,violTOL =1.0e-3, innerTOL=1.0e-4, outerTOL=1.0e-5, verbose = 1,random_state = 42,maxtime = 10800,LS =true, WS=false,inexact = true,rule=2,warm_start_partition="five",P=1,M=0,K=100,G=0,block=0,heuristics=false,J=0)
-    tic();
-    if random_state != -1
-        srand(random_state);
-    end
-    if WS == false
-        cur_time = @elapsed begin
-            searching_times = Array{Float64}([])
-            all_obj_times = Array{Float64}([])
-            pow_times = Array{Float64}([])
-            optimization_starting_times = Array{Int}([])
-            n,d = size(Xmat);
-            W = Array{Tuple{Int64,Int64},1}(n*(n-1));
-            Wlen = 0;
-            lamb = zeros(n*(n-1),1);
-            phi = Y;
-            xi = zeros(n*d,1);
-            k = 0;
+        if cur_time >= maxtime
+            println("early stopping after optimization due to time limit")
+            break
+        end
+        if stage == 1 && k > 1 && flag >= 5
             flag = 0;
-            all_objs = Array{Float64}([])
-            sorted_idx = Array{Int64}(n*(n-1));
-            if heuristics == true
-                rule = -1
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-                Wchecklen = Array{Int64,1}(n)
-                for i in 1:n
-                    Wchecklen[i] = 0;
-                    Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
+            stage = 2;
+            if dropzero
+                lamb = dropzeros(lamb)
+                if block ==0
+                    J,I,_ = findnz(lamb)
+                else
+                    I,J,_ = findnz(lamb)
                 end
-            else
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-                Wchecklen = Array{Int64,1}(0)
+                Wlen = length(lamb.nzval)
+                Wlen_prev = Wlen
+                W = sparse(J,I,fill(true,Wlen),n,n)
             end
-        end
-        initialize_time = cur_time;
-        searching_time = 0;
-    else
-        cur_time = @elapsed begin
-            searching_times = Array{Float64}([])
-            all_obj_times = Array{Float64}([])
-            pow_times = Array{Float64}([])
-            optimization_starting_times = Array{Int}([])
-            n,d = size(Xmat);
-            W,lamb,Wlen,last_obj = warm_start(Xmat,Y,rho,warm_start_partition,100,20,1.0e-2,1.0e-3,1.0e-3,100,block);
-            sorted_idx = Array{Int64}(n*(n-1));
-            sorted_idx[1:Wlen] = sortperm(W[1:Wlen]);
-            W[1:Wlen] = W[sorted_idx[1:Wlen]];
-            lamb[1:Wlen] = lamb[sorted_idx[1:Wlen]];
-            phi,xi = get_primal_solution_partial(Xmat,Y,rho,W[1:Wlen],lamb);
-            all_objs = Array{Float64}([])
-            L = 0;
-            if heuristics == true
-                rule = -1
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-                Wchecklen = Array{Int64,1}(n)
-                for i in 1:n
-                    Wchecklen[i] = 0;
-                    Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-                end
-            else
-                Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-                Wchecklen = Array{Int64,1}(0)
-            end
-        end
-        initialize_time = cur_time;
-        searching_time = 0;
-        append!(all_objs, last_obj)
-        append!(all_obj_times,cur_time)
-    end
-    if LS == true
-        L = 0
-    end
-    
-    for k in 1:maxiter
-        searching_time = @elapsed begin
-            Delta = active_set_augmentation(Xmat,Y,W[1:Wlen],Wlen,phi,xi,lamb,violTOL,rule,P,M,K,G,block,J,Wcheck,Wchecklen);
-            Delta_len = length(Delta);
-            if verbose >= 1
-                println("Iteration:")
-                println(k);
-            end
-            if Delta_len != 0
-                Wlen_new = Wlen + Delta_len
-                W[Wlen+1:Wlen_new] = Delta
-                sorted_idx[1:Wlen_new] = sortperm(W[1:Wlen_new]);
-                W[1:Wlen_new] = W[sorted_idx[1:Wlen_new]];
-                lamb[1:Wlen_new] = lamb[sorted_idx[1:Wlen_new]];
-                flag = 0
-                if verbose >= 1
-                    println(Wlen)
-                end
-                Wlen = Wlen_new
-                if verbose >= 1
-                    println(Wlen)
-                end
+        elseif stage == 2 &&  (k > 1&& (obj - last_obj > -params_list[stage].outerTOL || obj > last_obj * (1+params_list[stage].outerTOL)))
+            if flag >= 10
+                break
             else
                 flag += 1
-                if verbose >= 1
-                    println(Wlen)
-                    println(Wlen)
-                end
             end
         end
-        cur_time += searching_time
-        append!(searching_times,searching_time)
-        tmp_steps = max_steps
-        if inexact == true
-            if  k == maxiter
-                tmp_steps = 100
-            else
-                tmp_steps = max_steps
-            end
-        end
-        append!(optimization_starting_times, length(all_objs)+1)
-        if LS == true
-            solvetime = @elapsed objs,times,pow_time,phi,xi,lamb,L = cvxreg_qp_ineq_APG_ls_timing(Xmat, Y, rho, W[1:Wlen], Wlen, lamb, tmp_steps, L,innerTOL)
-        else
-            solvetime = @elapsed objs,times,pow_time,phi,xi,lamb = cvxreg_qp_ineq_APG_timing(Xmat, Y, rho, W[1:Wlen], Wlen, lamb, tmp_steps, innerTOL)
-        end
-        if cur_time + solvetime >= maxtime
-            append!(all_objs,objs)
-            append!(all_obj_times,cur_time+times)
-            append!(pow_times, pow_time)
-            if verbose >= 1
-                println(objs[end])
-                println(all_obj_times[end])
-            end
-            break
-        end
-        if k > 1
-            last_obj = all_objs[end];
-        end
-        if k > 1&& objs[end] - last_obj > -outerTOL*0.1 && objs[end] > last_obj * (1+outerTOL) && flag >= 5
-            append!(all_objs,objs)
-            append!(all_obj_times,cur_time+times)
-            append!(pow_times, pow_time)
-            if verbose >= 1
-                println(objs[end])
-                println(all_obj_times[end])
-            end
-            cur_time += solvetime
-            break
-        else
-            append!(all_objs,objs)
-            append!(all_obj_times,cur_time+times)
-            append!(pow_times, pow_time)
-            if verbose >= 1
-                println(objs[end])
-                println(all_obj_times[end])
-            end
-            cur_time += solvetime
-        end
+        last_obj = obj;
     end
-    solvetime = toq();
+    runtime = time() - start
     if verbose >= 1
-        println(solvetime)
+        println("\nConvex Regression finishes in ",runtime," s.")
     end
-    return all_objs,all_obj_times,initialize_time,searching_times,pow_times, optimization_starting_times,phi,xi,lamb, W,Wlen
+    return phi,xi,lamb, W, Wlen, all_objs,all_obj_times, stages,Wlen_list,searching_times,pow_times,f_evals_list, L_list, optimization_starting_steps
 end
 
-function active_set(Xmat, Y, rho, max_steps= 5,maxiter=50,violTOL =1.0e-3, innerTOL=1.0e-4, outerTOL=1.0e-5, verbose = 1,random_state = 42,LS =true, WS=false,inexact = true,rule=1,warm_start_partition="five",P=1,M=0,K=100,G=0,block=0,heuristics=false,J=0)
-    tic();
-    if random_state != -1
-        srand(random_state);
-    end
-    if WS == false
-        n,d = size(Xmat);
-        W = Array{Tuple{Int64,Int64},1}(n*(n-1));
-        Wlen = 0;
-        lamb = zeros(n*(n-1),1);
-        phi = Y;
-        xi = zeros(n*d,1);
-        k = 0;
-        flag = 0;
-        sorted_idx = Array{Int64}(n*(n-1));
-        obj = 0;
-        last_obj = 0;
-        if heuristics == true
-            rule = -1
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-            Wchecklen = Array{Int64,1}(n)
-            for i in 1:n
-                Wchecklen[i] = 0;
-                Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-            end
-        else
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-            Wchecklen = Array{Int64,1}(0)
-        end
-    else
-        n,d = size(Xmat);
-        W,lamb,Wlen,last_obj = warm_start(Xmat,Y,rho,warm_start_partition,100,20,1.0e-2,1.0e-3,1.0e-3,100,block);
-        sorted_idx = Array{Int64}(n*(n-1));
-        sorted_idx[1:Wlen] = sortperm(W[1:Wlen]);
-        W[1:Wlen] = W[sorted_idx[1:Wlen]];
-        lamb[1:Wlen] = lamb[sorted_idx[1:Wlen]];
-        phi,xi = get_primal_solution_partial(Xmat,Y,rho,W[1:Wlen],lamb);
-        obj = 0
-        L = 0;
-        if heuristics == true
-            rule = -1
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(n);
-            Wchecklen = Array{Int64,1}(n)
-            for i in 1:n
-                Wchecklen[i] = 0;
-                Wcheck[i] = Array{Tuple{Int64,Int64},1}(J);
-            end
-        else
-            Wcheck = Array{Array{Tuple{Int64,Int64},1},1}(0);
-            Wchecklen = Array{Int64,1}(0)
-        end
-    end
-    if LS == true
-        L = 0
-    end
-    
-    for k in 1:maxiter
-        Delta = active_set_augmentation(Xmat,Y,W[1:Wlen],Wlen,phi,xi,lamb,violTOL,rule,P,M,K,G,block,J,Wcheck,Wchecklen);
-        Delta_len = length(Delta);
-        if verbose >= 1
-            println("Iteration:")
-            println(k);
-        end
-        if Delta_len != 0
-            Wlen_new = Wlen + Delta_len
-            W[Wlen+1:Wlen_new] = Delta
-            sorted_idx[1:Wlen_new] = sortperm(W[1:Wlen_new]);
-            W[1:Wlen_new] = W[sorted_idx[1:Wlen_new]];
-            lamb[1:Wlen_new] = lamb[sorted_idx[1:Wlen_new]];
-            flag = 0
-            if verbose >= 1
-                println(Wlen)
-            end
-            Wlen = Wlen_new
-            if verbose >= 1
-                println(Wlen)
-            end
-        else
-            flag += 1
-            if verbose >= 1
-                println(Wlen)
-                println(Wlen)
-            end
-        end
-        tmp_steps = max_steps
-        if inexact == true
-            if  k == maxiter
-                tmp_steps = 100
-            else
-                tmp_steps = max_steps
-            end
-        end
-        if LS == true
-            phi,xi,lamb,L,obj = cvxreg_qp_ineq_APG_ls(Xmat, Y, rho, W[1:Wlen], Wlen, lamb, tmp_steps, L,innerTOL)
-        else
-            phi,xi,lamb,obj = cvxreg_qp_ineq_APG(Xmat, Y, rho, W[1:Wlen], Wlen, lamb, max_steps, innerTOL)
-        end
-        if k > 1&& obj - last_obj > -outerTOL*0.1 && obj > last_obj * (1+outerTOL) && flag >= 5
-            if verbose >= 1
-                println(obj)
-            end
-            break
-        else
-            if verbose >= 1
-                println(obj)
-            end
-            last_obj = obj;
-        end
-    end
-    solvetime = toq();
-    if verbose >= 1
-        println(solvetime)
-    end
-    return phi,xi,lamb, W,Wlen,obj
-end
+

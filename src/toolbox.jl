@@ -1,480 +1,365 @@
-function ptoi(i,j,n)
-    return (i-1)*(n-1)+((j>i)?(j-1):j)
+using LinearAlgebra, Random, SparseArrays,SIMD
+
+ActiveSet = SparseMatrixCSC{Bool,Int64}
+LambdaActiveSet = SparseMatrixCSC{T,Int64} where T<:AbstractFloat
+
+index2d(k::Int64, d::Int64) =  (k-1)*d+1:k*d
+
+function flat_to_mat(Xflat::Array{T,1},n::Int64,d::Int64) where T<:AbstractFloat
+    return copy(reshape(Xflat,(d,n))')
 end
-function itop(idx,n)
-    i = Int(floor((idx-1)/(n-1)))+1;
+
+function mat_to_flat(Xmat::Array{T,2},n::Int64,d::Int64) where T<:AbstractFloat
+    return reshape(copy(Xmat'),n*d)
+end
+
+function idx2pair(idx,n)
+    i = (idx-1)÷(n-1)+1;
     j = (idx-1)%(n-1)+1;
     j += (j>=i);
     return (i,j)
 end
-function A_dot_s(W,s,tmp=[])
-    tmp = zeros(length(W),1);
-    idx = 1;
-    for (i,j) in W
-        tmp[idx] = s[j] - s[i];
-        idx += 1;
+
+function A_dot_phi_plus_B_dot_xi!(res::Array{T,1},phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64,
+        n::Int64,d::Int64) where {T<:AbstractFloat}
+    @assert Wlen <= length(res)
+    fill!(res,0)
+    @simd for k in 1:Wlen
+       @inbounds res[k] = (phi[J[k]] - phi[I[k]]) + dot(Xflat[index2d(I[k],d)]-Xflat[index2d(J[k],d)], xi[index2d(I[k],d)]);
     end
-    return tmp
 end
-# function A_dot_s(W,s,tmp=[])
-#     N = length(W)
-#     tmp = SharedArray{Float64}(N);
-#     idx = 1;
-#     @parallel for idx in 1:N
-#         j = W[idx][2];
-#         i = W[idx][1];
-#         tmp[idx] = s[j] - s[i];
-#     end
-#     return reshape(Array(tmp),(length(W),1))
-# end
 
-function AT_dot_lamb(W,lamb,n,tmp =[])
-    tmp = zeros(n,1);
-    idx = 1;
-    for (i,j) in W
-        tmp[i] -= lamb[idx];
-        tmp[j] += lamb[idx];
-        idx += 1;
+function A_dot_phi_plus_B_dot_xi(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64,
+        n::Int64,d::Int64) where {T<:AbstractFloat}
+    res = zeros(eltype(phi),Wlen);
+    A_dot_phi_plus_B_dot_xi!(res, phi, xi, Xflat, I, J, Wlen, n, d)
+    return res
+end
+
+function A_dot_phi_plus_B_dot_xi!(res::Array{T,1},phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},block_id::Int64,entry_ids::Array{Int64,1},len::Int64,n::Int64,d::Int64;block=0::Int) where {T<:AbstractFloat}
+    @assert len <= length(res)
+    fill!(res,0)
+    if block == 0
+        i = block_id
+        @simd for k in 1:len
+            @inbounds res[k] = (phi[entry_ids[k]] - phi[i]) + dot(Xflat[index2d(i,d)]-Xflat[index2d(entry_ids[k],d)], xi[index2d(i,d)]); 
+        end   
+    else
+        j = block_id
+        @simd for k in 1:len
+            @inbounds res[k] = (phi[j] - phi[entry_ids[k]]) + dot(Xflat[index2d(entry_ids[k],d)]-Xflat[index2d(j,d)], xi[index2d(entry_ids[k],d)]); 
+        end   
     end
-    return tmp
 end
 
-
-function B_dot_s(Xmat,W,s,tmp = [])
-        tmp = zeros(length(W),1);
-        n,d = size(Xmat);
-        idx = 1;
-        for (i,j) in W
-            tmp[idx] = (Xmat[i,:] - Xmat[j,:])'*s[((i-1)*d+1):(i*d)];
-            idx += 1;
-        end
-        return tmp
+function A_dot_phi_plus_B_dot_xi(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},block_id::Int64,entry_ids::Array{Int64,1},len::Int64,n::Int64,d::Int64;block=0::Int) where {T<:AbstractFloat}
+    res = zeros(eltype(phi), len)
+    A_dot_phi_plus_B_dot_xi!(res, phi, xi, Xflat, block_id, entry_ids, len, n, d, block=block)
+    return res
 end
 
-
-function BT_dot_lamb(Xmat,W,lamb,tmp = [])
-        n,d = size(Xmat);
-        tmp = zeros(n*d,1);
-        idx = 1;
-        for (i,j) in W
-                tmp[((i-1)*d+1):(i*d)] += (Xmat[i,:] - Xmat[j,:]) * lamb[idx];
-                idx += 1;
-        end
-        return tmp
-end
-
-
-function S_dot_lamb(Xmat,rho,W,lamb,if_substract_Y=0,Y=[])
-    n = size(Xmat,1);
-    if if_substract_Y==0
-        Y = zeros(n,1);
+function A_dot_phi!(res::Array{T,1},phi::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64) where {T<:AbstractFloat}
+    @assert Wlen <= length(res)
+    fill!(res,0)
+    @simd for k in 1:Wlen
+       @inbounds res[k] = (phi[J[k]] - phi[I[k]]);
     end
-    tmp = A_dot_s(W,AT_dot_lamb(W,lamb,n)-Y)+1.0/rho*B_dot_s(Xmat,W,BT_dot_lamb(Xmat,W,lamb));
-    return tmp;
+end
+function A_dot_phi(phi::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64) where {T<:AbstractFloat}
+    res = zeros(eltype(phi), Wlen)
+    A_dot_phi!(res, phi, I, J, Wlen)
+    return res
 end
 
-function power_iter(Xmat,W,rho,maxiter = 300,TOL=1e-3)
+function B_dot_xi!(res::Array{T,1},xi::Array{T,1},Xflat::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, n::Int64,d::Int64) where {T<:AbstractFloat}
+    @assert Wlen <= length(res)
+    fill!(res,0)
+    @simd for k in 1:Wlen
+       @inbounds res[k] = dot(Xflat[index2d(I[k],d)]-Xflat[index2d(J[k],d)], xi[index2d(I[k],d)]);
+    end
+end
+function B_dot_xi(xi::Array{T,1},Xflat::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, n::Int64,d::Int64) where {T<:AbstractFloat}
+    res = zeros(eltype(phi), Wlen)
+    B_dot_xi!(res, xi, Xflat, I, J, Wlen, n, d)
+    return res
+end
+
+
+function AT_dot_lamb!(res::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},n::Int64) where T<:AbstractFloat
+    @assert n <= length(res)
+    fill!(res,0)
+    @simd for k in 1:Wlen
+        @inbounds res[I[k]]-=lamb[k];
+        @inbounds res[J[k]]+=lamb[k];
+    end
+end
+
+function AT_dot_lamb(I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},n::Int64) where T<:AbstractFloat
+    res = zeros(eltype(lamb), n)
+    AT_dot_lamb!(res,  I, J, Wlen, lamb, n)
+    return res
+end
+
+function BT_dot_lamb!(res::Array{T,1},Xflat::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},n::Int64,d::Int64) where T<:AbstractFloat
+    @assert n*d <= length(res)
+    fill!(res,0)
+    @simd for k in 1:Wlen
+        @inbounds res[index2d(I[k],d)] += lamb[k] * (Xflat[index2d(I[k],d)]-Xflat[index2d(J[k],d)]);
+    end
+end
+
+function BT_dot_lamb(Xflat::Array{T,1}, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},n::Int64,d::Int64) where T<:AbstractFloat
+    res = zeros(eltype(lamb),n*d)
+    BT_dot_lamb!(res, Xflat, I, J, Wlen, lamb, n, d)
+    return res
+end
+
+function Q_dot_lamb!(res::Array{T,1}, Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},
+        n::Int64, d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; if_subtract_Y=false::Bool) where T<:AbstractFloat
+    AT_dot_lamb!(phi_tmp, I, J, Wlen, lamb,n)
+    BT_dot_lamb!(xi_tmp, Xflat, I, J, Wlen, lamb,n,d)
+    xi_tmp ./=rho
+    if if_subtract_Y
+        phi_tmp .-= Y
+    end
+    A_dot_phi_plus_B_dot_xi!(res, phi_tmp,xi_tmp,Xflat,I,J,Wlen,n,d)
+end
+
+function Q_dot_lamb(Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},n::Int64, d::Int64; if_subtract_Y=false::Bool) where T<:AbstractFloat
+    res = zeros(eltype(Y),Wlen);
+    phi_tmp = zeros(eltype(Y),n);
+    xi_tmp = zeros(eltype(Y),n*d);
+    Q_dot_lamb!(res, Xflat, Y, rho, I, J, Wlen, lamb, n, d, phi_tmp, xi_tmp, if_subtract_Y=if_subtract_Y);
+    return res
+end
+
+function get_gradient_evaluation!(G::Array{T,1}, Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},
+        n::Int64, d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}) where T<:AbstractFloat 
+    Q_dot_lamb!(G, Xflat,Y,rho,I,J,Wlen,lamb,n,d,phi_tmp,xi_tmp,if_subtract_Y=true)
+end
+
+
+function power_iter(Xflat::Array{T,1},I::Array{Int64,1},J::Array{Int64,1},Wlen::Int64,rho::T,n::Int64,d::Int64;maxiter=300::Int64,TOL=1e-3::T) where T<:AbstractFloat
     rng = MersenneTwister(1234);
-    x = randn(rng,Float64,(length(W),1));
+    x = randn(rng,Float64,Wlen);
     x /= norm(x);
-    y = zeros(length(W),1); # pre-alloc
+    y = zeros(Wlen);
     nm = 0;
-    n,d = size(Xmat);
-    #tmp_W = zeros(length(W),1);
-    #tmp_n = zeros(n,1);
-    #tmp_nd = zeros(n*d,1);
+    phi_tmp = zeros(n);
+    xi_tmp = zeros(n*d);
     for k in 1:maxiter
-        #y = A_dot_s(W,AT_dot_lamb(W,x,n,tmp_n),tmp_W)+1.0/rho*B_dot_s(Xmat,W,BT_dot_lamb(Xmat,W,x,tmp_nd),tmp_W);
-        y = S_dot_lamb(Xmat,rho,W,x);
+        Q_dot_lamb!(y, Xflat,Y,rho,I,J, Wlen, x, n, d, phi_tmp, xi_tmp, if_subtract_Y=false)
         if (abs(nm-norm(y))<TOL)
-                break;
+            break;
         end
         nm = norm(y);
-        x = y/nm;
+        x .= y/nm;
     end
 
     return nm;
 end
 
-function generate_quadratic(Xmat,Y,rho)
-    n = size(Xmat,1);
-    S = zeros(n*(n-1),n*(n-1));
-    W = Array{Tuple{Int64,Int64},1}(n*(n-1));
-    idx = 1;
-    for i in 1:n
-        for j in setdiff(1:n,i)
-            W[idx] = (i,j);
-            idx +=1;
-        end
+function get_objective_value(Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},
+        n::Int64, d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}, s_tmp::Array{T,1}; get_phi_xi=false) where T<:AbstractFloat
+    AT_dot_lamb!(phi_tmp, I, J, Wlen, lamb,n)
+    BT_dot_lamb!(xi_tmp, Xflat, I, J, Wlen, lamb,n,d)
+    res = 0.
+    phi_tmp .-= Y
+    phi_tmp .-= Y
+    xi_tmp ./= rho
+    
+    A_dot_phi!(s_tmp, phi_tmp, I, J, Wlen)
+    res += 0.5*dot(lamb,s_tmp)
+    B_dot_xi!(s_tmp, xi_tmp, Xflat,I,J,Wlen,n,d)
+    res += 0.5*dot(lamb,s_tmp)
+    if get_phi_xi
+        phi_tmp .+= Y
+        phi_tmp .*= -1
+        xi_tmp .*= -1
     end
-
-    for k in 1:n*(n-1)
-        ek = zeros(n*(n-1),1);
-        ek[k] = 1;
-        S[:,k] = S_dot_lamb(Xmat,rho,W,ek);
-    end
-    s = A_dot_s(W,Y);
-    return S,s;
+    return res
 end
 
-
-function get_objective_value(Xmat, Y, rho, W, lamb)
-    n = size(Xmat,1);
-    obj = 0.5*lamb'*A_dot_s(W,AT_dot_lamb(W,lamb,n)-2Y)+1/(2*rho)*lamb'*B_dot_s(Xmat,W,BT_dot_lamb(Xmat,W,lamb));
+function get_objective_value(Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1}, n::Int64, d::Int64) where T<:AbstractFloat
+    obj = 0.5*dot(lamb, A_dot_phi(AT_dot_lamb(I,J,Wlen,lamb,n)-2Y,I,J,Wlen))+1/(2*rho)*dot(lamb,B_dot_xi(BT_dot_lamb(Xflat,I,J,Wlen,lamb,n,d),Xflat,I,J,Wlen,n,d));
     return obj
 end
 
-function get_primal_solution_partial(Xmat,Y,rho,W,lamb,ifsummary=false)
-    n,d = size(Xmat);
-    phi = zeros(n,1);
-    xi = zeros(n*d,1);
-    phi = Y - AT_dot_lamb(W,lamb,n);
-    xi = -BT_dot_lamb(Xmat,W,lamb)/rho;
-    if (ifsummary)
-        lamb = lamb[1:length(W)];
-        obj = get_objective_value(Xmat, Y, rho, W, lamb);
-        Wlen = sum(lamb.!=0);
-        W = W[lamb.!=0];
-        lamb = lamb[lamb.!=0];
-        Omega = Array{Tuple{Int64,Int64},1}(n*(n-1));
-        idx = 1;
-        for i in 1:n
-            for j in setdiff(1:n,i)
-                Omega[idx] = (i,j);
-                idx +=1;
-            end
-        end
-        viol = A_dot_s(Omega,phi) + B_dot_s(Xmat,Omega,xi);
-        return phi,xi,lamb,viol,obj,W,Wlen
-    end
-    return phi,xi
+function get_objective_value(Xmat::Array{T,2},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1}, n::Int64, d::Int64) where T<:AbstractFloat
+    return get_objective_value(mat_to_flat(Xmat,n,d),Y,rho,I,J, Wlen, lamb, n, d)
 end
 
-function get_primal_solution_whole(Xmat,Y,rho,lamb)
-    n = size(Xmat,1);
-    W = Array{Tuple{Int64,Int64},1}(n*(n-1));
-    idx = 1;
+function get_objective_value_gradient!(G::Array{T,1},Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},
+        n::Int64, d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}, s_tmp::Array{T,1}) where T<:AbstractFloat
+    AT_dot_lamb!(phi_tmp, I, J, Wlen, lamb,n)
+    BT_dot_lamb!(xi_tmp, Xflat, I, J, Wlen, lamb,n,d)
+    res = 0;
+    xi_tmp ./=rho
+    phi_tmp .-= Y
+    B_dot_xi!(s_tmp, xi_tmp, Xflat,I,J,Wlen,n,d)
+    res += 0.5 * dot(lamb,s_tmp)
+    G .= s_tmp
+    A_dot_phi!(s_tmp, phi_tmp, I, J, Wlen)
+    G .+= s_tmp
+    phi_tmp .-=  Y
+    A_dot_phi!(s_tmp, phi_tmp, I, J, Wlen)
+    res += 0.5 * dot(lamb,s_tmp)
+    
+    return res
+end
+
+
+function check_feasibility(Xflat::Array{T,1},n::Int64,d::Int64,phi::Array{T,1},xi::Array{T,1}; TOL = 1.e-10::T) where T<:AbstractFloat
+    min_constr = Inf
+    constr = 0.
     for i in 1:n
-        for j in setdiff(1:n,i)
-            W[idx] = (i,j);
-            idx +=1;
-        end
-    end
-    phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-    viol = A_dot_s(W,phi) + B_dot_s(Xmat,W,xi);
-    obj = get_objective_value(Xmat, Y, rho, W, lamb);
-    Wlen = sum(lamb.!=0);
-    W = W[(lamb.!=0)[:]];
-    lamb = lamb[(lamb.!=0)[:]];
-    return phi,xi,lamb,viol,obj,W,Wlen
-end
-
-function get_primal_feasible_solution(Xmat,Y,phi,xi,TOL = 1.0e-2)
-    n,d = size(Xmat);
-    phi_f = zeros(n,1);
-    xi_f = zeros(n*d,1);
-    for j in 1:n
-        W = [(i,j) for i in 1:n];
-        viol_j = A_dot_s(W,phi) + B_dot_s(Xmat,W,xi);
-        viol_j[j] = 0;
-        max_viol = minimum(viol_j);
-        phi_f[j] = phi[j] - max_viol;
-        xi_norm = 1e10;
-        for i in 1:n
-            if viol_j[i] == max_viol
-                if vecnorm(xi[(i-1)*d+1:i*d],2) < xi_norm
-                    xi_f[(j-1)*d+1:j*d] = xi[(i-1)*d+1:i*d]
+        @simd for j in 1:n
+            if j != i
+                @inbounds constr = phi[j]-phi[i]+ dot(Xflat[index2d(i,d)]-Xflat[index2d(j,d)], xi[index2d(i,d)])
+                if constr < -TOL
+                    return false
                 end
             end
         end
     end
-    return phi_f,xi_f;
+    return true;
 end
 
-function check_feasibility(Xmat,Y, phi,xi, TOL = 1.e-10)
-    n = size(Xmat,1);
-    Omega = Array{Tuple{Int64,Int64},1}(n*(n-1));
-    idx = 1;
+
+function compute_infeasibility(Xflat::Array{T,1},n::Int64,d::Int64,phi::Array{T,1},xi::Array{T,1}) where T<:AbstractFloat
+    infeas = 0.
+    max_viol = 0.
+    constr = 0.
     for i in 1:n
-        for j in setdiff(1:n,i)
-            Omega[idx] = (i,j);
-            idx +=1;
+        @simd for j in 1:n
+            if j != i
+                @inbounds constr = phi[j]-phi[i]+ dot(Xflat[index2d(i,d)]-Xflat[index2d(j,d)], xi[index2d(i,d)])
+                infeas += min(constr,0)^2
+                max_viol = min(max_viol,constr)
+            end
         end
     end
-    viol = A_dot_s(Omega,phi) + B_dot_s(Xmat,Omega,xi);
-    #println(minimum(viol))
-    return minimum(viol) >= -TOL;
+    infeas = sqrt(infeas)/n
+    return infeas,max_viol;
 end
 
-function get_duality_gap(Xmat, Y, rho, lamb, TOL = 1.0e-2)
-    #println(length(lamb));
-    phi,xi,lamb,viol,L_upper,W,Wlen = get_primal_solution_whole(Xmat,Y,rho,lamb);
-    phi_f,xi_f = get_primal_feasible_solution(Xmat,Y,phi,xi,1.0e-2);
-    L_lower = 0.5*vecnorm(phi_f-mean(phi_f)-Y+mean(Y))^2+rho/2*vecnorm(xi_f)^2;
-    println(check_feasibility(Xmat,Y,phi_f,xi_f));
-    max_viol = -minimum(viol);
-    num_tol_viol = sum(viol.<-TOL);
-    num_viol = sum(viol.<0);
-    return phi, xi, lamb, L_upper, L_upper-L_lower, max_viol, num_tol_viol, num_viol, W, Wlen
+
+
+function get_primal_solution!(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1}, n::Int64, d::Int64) where T<:AbstractFloat
+    AT_dot_lamb!(phi, I, J, Wlen, lamb,n)
+    BT_dot_lamb!(xi, Xflat, I, J, Wlen, lamb,n,d)
+    xi ./= (-rho)
+    phi .-= Y
+    phi .*= -1.
 end
 
-function get_duality_gap_partial(Xmat, Y, rho, W, lamb, TOL = 1.0e-2)
-    phi,xi,lamb,viol,L_upper,W,Wlen = get_primal_solution_partial(Xmat,Y,rho,W,lamb,true)
-    phi_f,xi_f = get_primal_feasible_solution(Xmat,Y,phi,xi,1.0e-2);
-    L_lower = 0.5*vecnorm(phi_f-Y)^2+rho/2*vecnorm(xi_f)^2;
-    println(check_feasibility(Xmat,Y,phi_f,xi_f));
-    max_viol = -minimum(viol);
-    num_tol_viol = sum(viol.<-TOL);
-    num_viol = sum(viol.<0);
-    return phi, xi, lamb, L_upper, L_upper+L_lower, max_viol, num_tol_viol, num_viol, W, Wlen
+
+
+function get_primal_feasible_solution(Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},phi::Array{T,1},xi::Array{T,1}, n::Int64, d::Int64) where T<:AbstractFloat
+    phi_f = similar(phi)
+    xi_f = similar(xi)
+    max_viol = 0.;
+    viol::Float64 = 0.;
+    nm_min::Float64 = Inf;
+    nm::Float64 = 0.;
+    argmin::Int64 = 0;
+    mean_max_viol::Float64 = 0.;
+    for j in 1:n
+        max_viol = 0.;
+        nm_min = norm(xi[index2d(j,d)]);
+        argmin = j;
+        for i in 1:n
+            if i == j
+                continue
+            end
+            @inbounds viol = phi[j] - phi[i] + dot(Xflat[index2d(i,d)]-Xflat[index2d(j,d)], xi[index2d(i,d)])
+            if viol < max_viol
+                max_viol = viol;
+                argmin = i;
+                nm_min = norm(xi[index2d(i,d)]);
+            elseif viol == max_viol
+                nm = norm(xi[index2d(i,d)]);
+                if nm < nm_min
+                    argmin = i;
+                    nm_min = nm;
+                end
+            end
+        end
+        mean_max_viol += max_viol;
+        phi_f[j] = phi[j] - max_viol;
+        xi_f[index2d(j,d)] .= xi[index2d(argmin,d)];
+    end
+    mean_max_viol /= n;
+    phi_f .+= mean_max_viol;
+    return phi_f, xi_f
 end
 
-function get_duality_gap_partial_info(Xmat, Y, rho, W, lamb, TOL = 1.0e-2)
-    phi,xi,lamb,viol,L_upper,W,Wlen = get_primal_solution_partial(Xmat,Y,rho,W,lamb,true)
-    phi_f,xi_f = get_primal_feasible_solution(Xmat,Y,phi,xi,1.0e-2);
-    L_lower = 0.5*vecnorm(phi_f-mean(phi_f)-Y+mean(Y))^2+rho/2*vecnorm(xi_f)^2;
-    #println(check_feasibility(Xmat,Y,phi_f,xi_f));
-    max_viol = -minimum(viol);
-    num_tol_viol = sum(viol.<-TOL);
-    num_viol = sum(viol.<0);
-    return L_upper+L_lower, max_viol, num_tol_viol, num_viol, Wlen, phi_f, xi_f
-end
 
-function partition_n_by_m(n,m)
-    np = Int(floor(n/m));
-    if np == n/m
-        partition = [(i-1)*m+1:i*m for i in 1:np]
+
+function get_duality_gap(Xflat::Array{T,1},Y::Array{T,1},rho::T,I::Array{Int64,1},J::Array{Int64,1}, Wlen::Int64, lamb::Array{T,1},phi::Array{T,1},xi::Array{T,1}, n::Int64, d::Int64; return_feasible_soln=false) where T<:AbstractFloat
+    s_tmp = zeros(Wlen)
+    L_upper = get_objective_value(Xflat,Y,rho,I,J, Wlen, lamb,n, d, phi, xi, s_tmp; get_phi_xi=true);
+    phi_f,xi_f = get_primal_feasible_solution(Xflat, Y, rho, I, J, Wlen, lamb, phi, xi, n, d);
+    L_lower = -(0.5*norm(phi_f-Y)^2+rho/2*norm(xi_f)^2)
+    if return_feasible_soln
+        return L_upper-L_lower, phi_f, xi_f
     else
-        partition = [(i-1)*m+1:min(i*m,n) for i in 1:(np+1)]
+        return L_upper-L_lower
+    end
+end
+
+
+function partition_n_by_m(n::Int64,m::Int64)::Array{UnitRange{Int64},1}
+    if n % m == 0
+        partition = [(i-1)*m+1:i*m for i in 1:(n÷m)]
+    else
+        partition = [(i-1)*m+1:min(i*m,n) for i in 1:(n÷m+1)]
     end
     return partition
 end
 
 
-function decoding_by_samples(W,Wlen,inv_samples)
-    N = length(inv_samples);
-    Wnew = Array{Tuple{Int64,Int64},1}(length(W));
-    for k in 1:Wlen
-        Wnew[k] = (inv_samples[W[k][1]],inv_samples[W[k][2]]);
-        if inv_samples[W[k][1]] == 0 || inv_samples[W[k][2]] == 0
-            println("wrong")
-        end
+function compute_phi_minus_xi_dot_x(res::Array{T,1},Xflat::Array{T,1},phi::Array{T,1},xi::Array{T,1},n::Int64,d::Int64) where T<:AbstractFloat
+    @assert length(res) == n
+    fill!(res,0)
+    @simd for i in 1:n
+        @inbounds res[i] = phi[i] - dot(Xflat[index2d(i,d)],xi[index2d(i,d)])
     end
-    Wnew[Wlen+1:end] = W[Wlen+1:end];
-    return Wnew
 end
-    
-function cvxreg_qp_ineq_APG(Xmat, Y, rho, Wwhole, Wlen, lamb, max_steps, TOL)
-    n,d =size(Xmat);
-    W = Wwhole[1:Wlen];
-    theta = 1;
-    L = power_iter(Xmat,W,rho);
-        #println(L);
-    lx = lamb[1:Wlen];
-    ly = lx;
-    fnew = 0;
-    objs = zeros(max_steps+1);
-    f = get_objective_value(Xmat, Y, rho, W, lx);
-    k = 0;
-    tmp = zeros(Wlen,1);
-    lxnew = zeros(Wlen,1);
-    for k in 1:max_steps
-        tmp = S_dot_lamb(Xmat,rho,W,ly,1,Y);
-        lxnew = min.(ly - tmp/L,0);
-        fnew = get_objective_value(Xmat, Y, rho, W, lxnew);
-        if (fnew[1,1] > f[1,1])
-                theta = 1;
-        end
-        if (fnew[1,1] - f[1,1] >-TOL*0.1 && fnew[1,1] <= f[1,1] &&fnew[1,1]>f[1,1]*(1+TOL))
-                break
-        end
-        thetanew = (1+sqrt(1+4*theta^2))/2;
-        gam = (theta-1)/thetanew;
-        ly = lxnew + gam*(lxnew - lx);
-        lx = lxnew;
-        theta = thetanew;
-        f = fnew;
+
+
+
+function cvx_predict!(y_pred::Array{T,1},Xtest::Array{T,2},phi::Array{T,1},Xi::Array{T,2}, n::Int64, d::Int64, piecevalues::Array{T,1},phi_minus_xi_dot_x::Array{T,1}) where T<:AbstractFloat
+    ntest = size(Xtest,1)
+    for j in 1:ntest
+        max_ϕ = -Inf;
+        piecevalues .= phi_minus_xi_dot_x
+        piecevalues .+= Xi * Xtest[j,:]
+        y_pred[j] = maximum(piecevalues);
     end
-    lamb[1:Wlen] = lxnew;
-    phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-    return phi,xi,lamb,fnew[1,1]
 end
-    
-function cvxreg_qp_ineq_APG_timing(Xmat, Y, rho, Wwhole, Wlen, lamb, max_steps, TOL)
-    all_times = Array{Float64}([])
-    cur_time = @elapsed begin
-        n,d =size(Xmat);
-        W = Wwhole[1:Wlen];
-        theta = 1;
-        #println(W)
-        pow_time = @elapsed L = power_iter(Xmat,W,rho);
-        #println(L);
-        lx = lamb[1:Wlen];
-        ly = lx;
-        fnew = 0;
-        objs = zeros(max_steps+1);
-        f = get_objective_value(Xmat, Y, rho, W, lx);
-        objs[1] = f[1,1]
-        k = 0;
-        tmp = zeros(Wlen,1);
-        lxnew = zeros(Wlen,1);
-    end
-    append!(all_times,cur_time)
-    for k in 1:max_steps
-        cur_time += @elapsed begin
-            #tmp = A_dot_s(W,AT_dot_lamb(W,ly,n,tmp_n)-Y,tmp_W)+1.0/rho*B_dot_s(Xmat,W,BT_dot_lamb(Xmat,W,ly,tmp_nd),tmp_W);
-            tmp = S_dot_lamb(Xmat,rho,W,ly,1,Y);
-            lxnew = min.(ly - tmp/L,0);
-            fnew = get_objective_value(Xmat, Y, rho, W, lxnew);
-            objs[k+1] = fnew[1,1]
-        end
-        append!(all_times,cur_time)
-        cur_time += @elapsed begin
-            if (fnew[1,1] > f[1,1])
-                    theta = 1;
-            end
-            if (fnew[1,1] - f[1,1] >-TOL && fnew[1,1] <= f[1,1] &&fnew[1,1]>f[1,1]*(1+TOL))
-                    break
-            end
-            thetanew = (1+sqrt(1+4*theta^2))/2;
-            gam = (theta-1)/thetanew;
-            ly = lxnew + gam*(lxnew - lx);
-            lx = lxnew;
-            theta = thetanew;
-            f = fnew;
-        end
-    end
-        lamb[1:Wlen] = lxnew;
-        phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-    return objs[1:k+1],all_times[1:k+1],pow_time,phi,xi,lamb
+
+
+function cvx_predict(Xtest::Array{T,2},Xflat::Array{T,1},phi::Array{T,1},xi::Array{T,1}, n::Int64, d::Int64) where T<:AbstractFloat
+    ntest =size(Xtest,1)
+    y_pred = zeros(ntest)
+    piecevalues = zeros(n)
+    phi_minus_xi_dot_x = zeros(n)
+    compute_phi_minus_xi_dot_x(phi_minus_xi_dot_x,Xflat,phi,xi,n,d)
+    cvx_predict!(y_pred,Xtest,phi,copy(reshape(xi,(d,n))'),n,d,piecevalues,phi_minus_xi_dot_x)
+    return y_pred
 end
-    
-    
-function cvxreg_qp_ineq_APG_ls(Xmat, Y, rho, Wwhole, Wlen, lamb, max_steps, L, TOL=1e-10)
-        beta_1 = 0.9
-        beta_2 = 0.98
-            n,d =size(Xmat);
-            W = Wwhole[1:Wlen];
-            theta = 1;
-            
-            search_flag = 0;
-            if L <= 0
-                L = power_iter(Xmat,W,rho);
-                pow_time = 1;
-            else
-                pow_time = -1;
-            end
-            lx = lamb[1:Wlen];
-            ly = lx;
-            fnew = 0;
-            objs = zeros(max_steps+1);
-            f = get_objective_value(Xmat, Y, rho, W, lx);
-            objs[1] = f[1,1]
-            k = 0;
-            tmp = zeros(Wlen,1);
-            lxnew = zeros(Wlen,1);
-        for k in 1:max_steps
-                    #tmp = A_dot_s(W,AT_dot_lamb(W,ly,n,tmp_n)-Y,tmp_W)+1.0/rho*B_dot_s(Xmat,W,BT_dot_lamb(Xmat,W,ly,tmp_nd),tmp_W);
-                    tmp = S_dot_lamb(Xmat,rho,W,ly,1,Y);
-                    while(true)
-                        lxnew = min.(ly - tmp/L,0);
-                        fnew = get_objective_value(Xmat, Y, rho, W, lxnew);
-                        if (pow_time > 0 || fnew[1,1] <= f[1,1] + (tmp' * (lxnew - ly))[1,1] + L/2*norm(lxnew-ly,2)^2 || search_flag >= 50)
-                            search_flag = 0
-                            break
-                        else
-                            L /= ((k==1)? beta_1:beta_2);
-                            search_flag += 1
-                            if search_flag >= 20
-                                L = power_iter(Xmat,W,rho,50)
-                            end
-                        end
-                    end
-                    objs[k+1] = fnew[1,1]
-                    if (fnew[1,1] > f[1,1])
-                            theta = 1;
-                    end
-                    if (fnew[1,1] - f[1,1] >-TOL && fnew[1,1] <= f[1,1])
-                            break
-                    end
-                    thetanew = (1+sqrt(1+4*theta^2))/2;
-                    gam = (theta-1)/thetanew;
-                    ly = lxnew + gam*(lxnew - lx);
-                    lx = lxnew;
-                    theta = thetanew;
-                    f = fnew;
-        end
-        lamb[1:Wlen] = lxnew;
-        phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-        return phi,xi,lamb,L,fnew[1,1]
+
+
+
+
+function rmse(y_pred, y)
+    return norm(y_pred-y)/sqrt(length(y))
 end
-            
-function cvxreg_qp_ineq_APG_ls_timing(Xmat, Y, rho, Wwhole, Wlen, lamb, max_steps, L, TOL=1e-10)
-        beta_1 = 0.9
-        beta_2 = 0.98
-        all_times = Array{Float64}([])
-        cur_time = @elapsed begin
-            n,d =size(Xmat);
-            W = Wwhole[1:Wlen];
-            theta = 1;
-            search_flag = 0;
-            if L <= 0
-                pow_time = @elapsed L = power_iter(Xmat,W,rho);
-            else
-                pow_time = -1
-            end
-            println("L = ", L);
-            lx = lamb[1:Wlen];
-            ly = lx;
-            fnew = 0;
-            objs = zeros(max_steps+1);
-            f = get_objective_value(Xmat, Y, rho, W, lx);
-            objs[1] = f[1,1]
-            k = 0;
-            tmp = zeros(Wlen,1);
-            lxnew = zeros(Wlen,1);
-            #tmp_W = zeros(Wlen,1);
-            #tmp_n = zeros(n,1);
-            #tmp_nd = zeros(n*d,1);
-        end
-        append!(all_times,cur_time)
-        for k in 1:max_steps
-                cur_time += @elapsed begin
-                    #tmp = A_dot_s(W,AT_dot_lamb(W,ly,n,tmp_n)-Y,tmp_W)+1.0/rho*B_dot_s(Xmat,W,BT_dot_lamb(Xmat,W,ly,tmp_nd),tmp_W);
-                    tmp = S_dot_lamb(Xmat,rho,W,ly,1,Y);
-                    while(true)
-                        lxnew = min.(ly - tmp/L,0);
-                        fnew = get_objective_value(Xmat, Y, rho, W, lxnew);
-                        if (pow_time > 0 || fnew[1,1] <= f[1,1] + (tmp' * (lxnew - ly))[1,1] + L/2*norm(lxnew-ly,2)^2 || search_flag >= 50)
-                            search_flag = 0
-                            break
-                        else
-                            L /= ((k==1)? beta_1:beta_2);
-                            search_flag += 1
-                            if search_flag >= 20
-                                L = power_iter(Xmat,W,rho,50)
-                            end
-                        end
-                    end
-                    objs[k+1] = fnew[1,1]
-                end
-                append!(all_times,cur_time)
-                cur_time += @elapsed begin
-                    if (fnew[1,1] > f[1,1])
-                            theta = 1;
-                    end
-                    if (fnew[1,1] - f[1,1] >-TOL && fnew[1,1] <= f[1,1])
-                            break
-                    end
-                    thetanew = (1+sqrt(1+4*theta^2))/2;
-                    gam = (theta-1)/thetanew;
-                    ly = lxnew + gam*(lxnew - lx);
-                    lx = lxnew;
-                    theta = thetanew;
-                    f = fnew;
-                end
-        end
-        lamb[1:Wlen] = lxnew;
-        phi,xi = get_primal_solution_partial(Xmat,Y,rho,W,lamb);
-        return objs[1:k+1],all_times[1:k+1],pow_time,phi,xi,lamb,L
+
+function rsquared(y_pred, y)
+    y_mean = mean(y)
+    return 1-sum((y_pred.-y).^2)/sum((y.-y_mean).^2)
 end
+
+
