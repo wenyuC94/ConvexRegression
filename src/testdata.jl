@@ -1,4 +1,6 @@
-using Statistics,Random,LinearAlgebra,HDF5,JLD
+using Statistics,Random,LinearAlgebra,HDF5
+
+PREFIX = "/home/wenyu/Research/CvxReg/dataset/"
 
 function randb(rng::AbstractRNG,n::Int64, d::Int64, r::Float64=0.8, boundary::Union{Nothing,Bool}=nothing)
     if typeof(boundary) == Nothing
@@ -44,21 +46,21 @@ function generate_training_test_samples(func_type,ntrain,ntest,d,r,SNR,random_st
         end
     elseif func_type == "B"
         ######## Type B ########
-        ### phi(x) = max_j <a_j,x>
-        a = 2 * rand(d,2*d) .- 1.
-        for (x,y) in zip([xtrain,xtest,xtest_bd,xtest_int],[ytrain,ytest,ytest_bd,ytest_int])
-            y .= map(z->maximum(a'*z), eachslice(x, dims=1))
-        end
-    elseif func_type == "C"
-        ######## Type C ########
         ### phi(x) = norm(x,4)^4
         for (x,y) in zip([xtrain,xtest,xtest_bd,xtest_int],[ytrain,ytest,ytest_bd,ytest_int])
             y .= map(z->norm(z,4)^4, eachslice(x, dims=1))
         end
+    elseif func_type == "C"
+        ######## Type C ########
+        ### phi(x) = max_j <a_j,x>
+        a = 2 * rand(d,2*d) - 1
+        for (x,y) in zip([xtrain,xtest,xtest_bd,xtest_int],[ytrain,ytest,ytest_bd,ytest_int])
+            y .= map(z->max(a'*z), eachslice(x, dims=1))
+        end
     elseif func_type == "D"
         ######## Type D ########
         ### phi(x) =  <a,x>
-        a = 2*rand(d) .- 1
+        a = 2*rand(d,1) - 1
         for (x,y) in zip([xtrain,xtest,xtest_bd,xtest_int],[ytrain,ytest,ytest_bd,ytest_int])
             y .= map(z->dot(a,z), eachslice(x, dims=1))
         end
@@ -116,4 +118,47 @@ function load_dataset(fname)
     end
         
     return xtrain, ytrain, xtest, ytest, xtest_bd, ytest_bd, xtest_int, ytest_int
+end
+
+function load_synthetic_dataset(func_type,ntrain,ntest,d,r,SNR,random_state;version=:original)
+    if version == :original
+        ver_str = "data"
+    elseif version == :revision
+        ver_str = "data-revision"
+    end
+    if SNR == Inf
+        fname = string(PREFIX,"synthetic/",ver_str,"/",func_type,"_",ntrain,"_",ntest,"_",d,"_",r,"_",SNR,"_",random_state,".jld")
+    else
+        fname = string(PREFIX,"synthetic/",ver_str,"/",func_type,"_",ntrain,"_",ntest,"_",d,"_",r,"_",Int(SNR),"_",random_state,".jld")
+    end
+    return load_dataset(fname)
+end
+
+
+function load_real_dataset(fname)
+    fpath = string(PREFIX,"real/proc/",fname,".h5")
+    return load_dataset(fpath)
+end
+
+function load_real_dataset(fname,idx)
+    if fname == "wages"
+        fpath = string(PREFIX,"real/proc/wages-10000-",idx,".h5")
+    elseif fname == "emission"
+        fpath = string(PREFIX,"real/proc/emission-1000-",idx,".h5")
+    end
+    return load_dataset(fpath)
+end
+
+function load_real_dataset(fname,n,idx)
+    if fname == "wages"
+        fpath = string(PREFIX,"real/proc/wages-",n,"-",idx,".h5")
+    elseif fname == "emission"
+        fpath = string(PREFIX,"real/proc/emission-",n,"-",idx,".h5")
+    end
+    return load_dataset(fpath)
+end
+
+function load_real_dataset(fname,n,SNR,idx)
+    fpath = string(PREFIX,"real/proc/",fname,"-",n,"-",SNR,"-",idx,".h5")
+    return load_dataset(fpath)
 end

@@ -3,7 +3,6 @@ include("toolbox.jl")
 
 
 
-
 function augmentation_rule1(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::Array{T,1},W::ActiveSet,Wlen::Int64,lamb::LambdaActiveSet,n::Int64,d::Int64,
         viol::Array{T,1},sort_index::Array{Int64,1},all_entries::Array{Int64,1}, entries::Array{Int64,1};
         TOL=1e-3::T,P=1::Int64,block=0::Int64) where {T <:  AbstractFloat}
@@ -28,15 +27,13 @@ function augmentation_rule1(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::
         end
         A_dot_phi_plus_B_dot_xi!(viol,phi,xi,Xflat,i,entries,len,n,d,block=block);
         P1 = min(sum(viol.<-TOL),P);
-        if P1 == 0
-            continue
-        elseif P1 == 1
+        if P1 == 1
             _,p = findmin(viol);
             W[entries[p],i] = true
             lamb[entries[p],i] = -1e-16
             lamb[entries[p],i] = 0.0
             Wlen += 1
-        else
+        elseif P1 > 1
             sortperm!(sort_index,viol;alg=PartialQuickSort(P1))
             for k in 1:P1
                 W[entries[sort_index[k]],i] = true
@@ -64,7 +61,6 @@ function augmentation_rule2(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::
         elseif block == 1 && W[i,j]
             continue
         end
-        
         @inbounds viol = phi[j] - phi[i] + dot(Xflat[index2d(i,d)]-Xflat[index2d(j,d)], xi[index2d(i,d)])
         if viol < -TOL
             if block == 0
@@ -127,14 +123,17 @@ function augmentation_rule3(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::
 end
 
 function augmentation_rule4(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::Array{T,1},W::ActiveSet,Wlen::Int64,lamb::LambdaActiveSet,
-        n::Int64,d::Int64,viol::Array{T,1},sort_index::Array{Int64,1},samples::Array{Int64,1}, I_tmp::Array{Int64,1}, J_tmp::Array{Int64,1};TOL=1e-3,M=4n, K=n,block=0) where T<:AbstractFloat
+        n::Int64,d::Int64,viol::Array{T,1},sort_index::Array{Int64,1},samples::Array{Int64,1}, I_tmp::Array{Int64,1}, J_tmp::Array{Int64,1};
+        TOL=1e-3,M=4n, K=n,block=0) where T<:AbstractFloat
     i::Int64 = 0
     j::Int64 = 0
     fill!(viol,0);
     len = 0;
     total_viol = 0;
     @assert length(samples) == M
-    sample!(1:n*(n-1), samples, replace=false)
+    
+    
+    sample!(1:n*(n-1), samples,replace=false)
     for k in samples
         (i,j) = idx2pair(k, n)
         if block == 0 && W[j,i]
@@ -197,15 +196,13 @@ function augmentation_rule5(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::
         end
         A_dot_phi_plus_B_dot_xi!(viol,phi,xi,Xflat,i,entries,len,n,d,block=block);
         P1 = min(sum(viol.<-TOL),P);
-        if P1 == 0
-            continue
-        elseif P1 == 1
+        if P1 == 1
             _,p = findmin(viol);
             W[entries[p],i] = true
             lamb[entries[p],i] = -1e-16
             lamb[entries[p],i] = 0.0
             Wlen += 1
-        else
+        elseif P1 > 1
             sortperm!(sort_index,viol;alg=PartialQuickSort(P1))
             for k in 1:P1
                 W[entries[sort_index[k]],i] = true
@@ -235,9 +232,33 @@ struct ActiveSetAugmentation
     samples::Union{Nothing, Array{Int64,1}};
     I_tmp::Union{Nothing, Array{Int64,1}};
     J_tmp::Union{Nothing, Array{Int64,1}};
-    function ActiveSetAugmentation(rule, n, block, TOL; P=0, M=0,K=0,G=0)
+    ### dynamic
+    dynamic::Bool;
+    dynamic_variable::Symbol;
+    increase_freq::Int64;
+    increment::Int64;
+    current_calls::Base.RefValue{Int64};
+    current_variable::Base.RefValue{Int64};
+    
+    function ActiveSetAugmentation(rule, n, block, TOL;P=0, M=0,K=0,G=0,ε=-1,α=-1, multiplier=1,addall=false,dynamic=false,dynamic_variable=:P, increase_freq=0,increment=0)
+        if ~dynamic
+            dynamic_variable = :none
+            increase_freq = 0;
+            increment = 0;
+        end
+        current_calls = Ref{Int64}(0);
+        current_variable = Ref{Int64}(0);
         if rule == 1
-            P = (P == 0) ? 1 : P;
+            if ~addall
+                P = (P == 0) ? min(multiplier,n-1) : P;
+            else
+                P = n-1;
+            end
+            if dynamic
+                dynamic_variable = :P
+                increase_freq = (increase_freq == 0) ? 1 : increase_freq;
+                increment = (increment == 0) ? 1 : increment;
+            end
             viol = zeros(Float64, n-1)
             sort_index = zeros(Int64, n-1)
             all_entries = zeros(Int64, n-1)
@@ -246,7 +267,7 @@ struct ActiveSetAugmentation
             I_tmp = nothing;
             J_tmp = nothing;
         elseif rule == 2
-            K = (K == 0) ? n : K;
+            K = (K == 0) ? min(n*multiplier,n*(n-1)) : K;
             viol = nothing
             sort_index = nothing;
             all_entries = nothing;
@@ -255,7 +276,7 @@ struct ActiveSetAugmentation
             I_tmp = nothing;
             J_tmp = nothing;
         elseif rule == 3
-            P = (P == 0) ? 1 : P;
+            P = (P == 0) ? min(multiplier, n-1) : P;
             viol = nothing
             sort_index = nothing;
             all_entries = zeros(Int64, n-1);
@@ -264,7 +285,7 @@ struct ActiveSetAugmentation
             I_tmp = nothing;
             J_tmp = nothing;
         elseif rule == 4
-            K = (K == 0) ? n : K;
+            K = (K == 0) ? min(n*multiplier, n*(n-1)) : K;
             M = (M == 0) ? min(4*K, n*(n-1)) : max(M,K);
             viol = zeros(Float64,M);
             sort_index = zeros(Int64,M);
@@ -274,8 +295,19 @@ struct ActiveSetAugmentation
             I_tmp = zeros(Int64, M);
             J_tmp = zeros(Int64, M);
         elseif rule == 5
-            P = (P == 0) ? 4 : P;
-            G = (G == 0) ? n÷P : min(n÷P, G);
+            if ~addall
+                P1 = (P == 0) ? 4 : P;
+                G = (G == 0) ? n÷P1 : min(n÷P1, G);
+                P = (P == 0) ? 4*multiplier : P1;
+            else
+                G = (G == 0) ? n÷4 : min(n÷4, G);
+                P = n-1;
+            end
+            if dynamic
+                dynamic_variable = :P
+                increase_freq = (increase_freq == 0) ? 1 : increase_freq;
+                increment = (increment == 0) ? 4 : increment;
+            end
             viol = zeros(Float64, n-1)
             sort_index = zeros(Int64, n-1)
             all_entries = zeros(Int64, n-1)
@@ -284,13 +316,23 @@ struct ActiveSetAugmentation
             I_tmp = nothing;
             J_tmp = nothing;
         end
-        new(rule, n, P, M, K, G, block,TOL,viol,sort_index,all_entries,entries, samples,I_tmp,J_tmp);
+        new(rule, n, P, M, K, G, block,TOL,viol,sort_index,all_entries,entries, samples,I_tmp,J_tmp,
+            dynamic,dynamic_variable,increase_freq,increment,current_calls,current_variable);
     end
 end
 
 function (aug::ActiveSetAugmentation)(phi::Array{T,1},xi::Array{T,1},Xflat::Array{T,1},Y::Array{T,1},W::ActiveSet,Wlen::Int64,lamb::LambdaActiveSet,n::Int64,d::Int64) where{T<:AbstractFloat}
     if aug.rule == 1
-        return augmentation_rule1(phi,xi,Xflat,Y,W,Wlen,lamb,n,d,aug.viol,aug.sort_index,aug.all_entries, aug.entries;TOL=aug.TOL,P=aug.P,block=aug.block)
+        P = aug.P;
+        if aug.dynamic
+            aug.current_calls[] += 1
+            P = min(aug.current_variable[],n-1);
+            if aug.current_calls[] % aug.increase_freq == 0
+                aug.current_variable[] += aug.increment;
+            end
+        end
+        return augmentation_rule1(phi,xi,Xflat,Y,W,Wlen,lamb,n,d,aug.viol,aug.sort_index,aug.all_entries, aug.entries;TOL=aug.TOL,P=P,block=aug.block)
+        
     elseif aug.rule == 2
         return augmentation_rule2(phi,xi,Xflat,Y,W,Wlen,lamb,n,d,aug.samples;TOL=aug.TOL,K=aug.K,block=aug.block)
     elseif aug.rule == 3
@@ -298,7 +340,15 @@ function (aug::ActiveSetAugmentation)(phi::Array{T,1},xi::Array{T,1},Xflat::Arra
     elseif aug.rule == 4
         return augmentation_rule4(phi,xi,Xflat,Y,W,Wlen,lamb,n,d,aug.viol,aug.sort_index,aug.samples,aug.I_tmp, aug.J_tmp;TOL=aug.TOL,M=aug.M,K=aug.K,block=aug.block)
     elseif aug.rule == 5
-        return augmentation_rule5(phi,xi,Xflat,Y,W,Wlen,lamb,n,d,aug.viol,aug.sort_index,aug.samples,aug.all_entries,aug.entries;TOL=aug.TOL,G=aug.G,P=aug.P,block=aug.block)
+        P = aug.P;
+        if aug.dynamic
+            aug.current_calls[] += 1
+            P = min(aug.current_variable[],n-1);
+            if aug.current_calls[] % aug.increase_freq == 0
+                aug.current_variable[] += aug.increment;
+            end
+        end
+        return augmentation_rule5(phi,xi,Xflat,Y,W,Wlen,lamb,n,d,aug.viol,aug.sort_index,aug.samples,aug.all_entries,aug.entries;TOL=aug.TOL,G=aug.G,P=P,block=aug.block)
     end
 end
 

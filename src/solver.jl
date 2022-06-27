@@ -2,7 +2,7 @@ include("toolbox.jl")
 include("lbfgsb-wrapper.jl")
 
 function cvxreg_qp_ineq_APG(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, 
-        lamb::LambdaActiveSet, n::Int64,d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; max_steps=1000, TOL=1e-4) where T<:AbstractFloat
+        lamb::LambdaActiveSet, n::Int64,d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; max_steps=1000, min_steps = 5, TOL=1e-4) where T<:AbstractFloat
     θ::Float64 = 1.0;
     θ_new::Float64 = 1.0;
     L = power_iter(Xflat,I,J,Wlen,rho,n,d);
@@ -23,7 +23,7 @@ function cvxreg_qp_ineq_APG(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{I
                 λ_new .= λ_x;
                 λ_y .= λ_x;
         end
-        if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL))
+        if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL) && k >= min_steps)
                 break
         end
         θ_new = (1+sqrt(1+4*θ^2))/2;
@@ -42,7 +42,7 @@ function cvxreg_qp_ineq_APG(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{I
 end
 
 function cvxreg_qp_ineq_APG_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, 
-        lamb::LambdaActiveSet, n::Int64,d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; max_steps=1000, TOL=1e-4, start_time = 0., end_time = Inf) where T<:AbstractFloat
+        lamb::LambdaActiveSet, n::Int64,d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; max_steps=1000, min_steps = 5, TOL=1e-4) where T<:AbstractFloat
     all_times = zeros(Float64,max_steps+1);
     cur_time = @elapsed begin
         θ::Float64 = 1.0;
@@ -59,7 +59,6 @@ function cvxreg_qp_ineq_APG_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, 
         k = 0;
         iter = 0;
         objs[1] = f;
-        status= 0;
     end
     all_times[1] = cur_time;
     for k in 1:max_steps
@@ -77,8 +76,7 @@ function cvxreg_qp_ineq_APG_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, 
                     λ_new .= λ_x;
                     λ_y .= λ_x;
             end
-            if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL))
-                status = 1
+            if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL)  && k >= min_steps)
                     break
             end
             θ_new = (1+sqrt(1+4*θ^2))/2;
@@ -88,17 +86,12 @@ function cvxreg_qp_ineq_APG_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, 
             θ = θ_new;
             f = fnew;
         end
-        if start_time + cur_time >= end_time
-            println("early stopping during optimization due to time limit")
-            status = -1
-            break
-        end
     end
     lamb.nzval .= λ_new
     phi_tmp .+= Y
     phi_tmp .*= -1
     xi_tmp .*= -1
-    return status, fnew, all_times[1:iter+1], objs[1:iter+1], pow_time, L, iter
+    return fnew, all_times[1:iter+1], objs[1:iter+1], pow_time, L, iter
 end
 
 
@@ -106,28 +99,60 @@ end
 
 function cvxreg_qp_ineq_APG_ls(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, 
         lamb::LambdaActiveSet, L::T, n::Int64, d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; 
-        β_1 = 0.9, β_2 = 0.98, max_steps=1000::Int64, TOL=1e-4::T, maxls = 20::Int64) where T<:AbstractFloat
+        β_1 = 0.8, β_2 = 0.95, max_steps=1000::Int64, min_steps = 0::Int64, TOL=1e-4::T, maxls = 20::Int64, 
+        L_init_estimate=:power, decrease_L = false, linesearch_type=:sufficient_decrease) where T<:AbstractFloat
     θ::Float64 = 1.0;
     θ_new::Float64 = 1.0;
     cur_ls = 0;
-    if L <= 0
-        L = power_iter(Xflat,I,J,Wlen,rho,n,d);
-        cur_ls = maxls;
-    end
     λ_x = copy(lamb.nzval);
     λ_y = copy(lamb.nzval);
     λ_new = zeros(eltype(Y),Wlen);
     s_tmp = zeros(eltype(Y),Wlen);
     grad = zeros(eltype(Y),Wlen);
+    f = 0.;
     fnew = 0.;
-    f = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+    grad_new = zeros(eltype(Y),Wlen);
+    if L <= 0
+        if L_init_estimate == :power
+            L = power_iter(Xflat,I,J,Wlen,rho,n,d);
+            f = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+            cur_ls = maxls;
+        else
+            f = get_objective_value_gradient!(grad, Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+            λ_new = min.(λ_y - grad,0);
+            fnew = get_objective_value_gradient!(grad_new, Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
+            L = norm(grad_new.-grad,2)/norm(λ_new-λ_y,2);
+        end
+    else
+        f = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+    end
+    ls_flag = false;
     k = 0;
     for k in 1:max_steps
+        ls_flag = false;
         get_gradient_evaluation!(grad, Xflat,Y,rho,I,J, Wlen, λ_y,n,d, phi_tmp, xi_tmp);
+        if decrease_L
+            L *= ((k==1) ? β_1 : β_2);
+        end
         while (true)
             λ_new .= min.(λ_y - grad/L,0);
-            fnew = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
-            if cur_ls >= maxls || fnew <= f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2
+            if linesearch_type == :sufficient_decrease
+                fnew = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
+            else
+                fnew = get_objective_value_gradient!(grad_new, Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
+            end
+            if cur_ls >= maxls
+                ls_flag = true
+            elseif linesearch_type == :sufficient_decrease 
+                ls_flag = (fnew <= f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2)
+            elseif linesearch_type == :inner_product_condition
+                if (fnew - f) > 0.01*max(abs(fnew), abs(f), 1) 
+                    ls_flag = (fnew <= f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2)
+                else
+                    ls_flag = (abs(dot(λ_new - λ_y, grad_new - grad)) <= L/2 * norm(λ_new - λ_y,2)^2)
+                end
+            end
+            if ls_flag
                 cur_ls = 0
                 break
             else
@@ -135,8 +160,6 @@ function cvxreg_qp_ineq_APG_ls(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Arra
                 cur_ls += 1
                 if cur_ls >= maxls
                     L = power_iter(Xflat,I,J,Wlen,rho,n,d,maxiter=50);
-                    cur_ls = 0;
-                    break
                 end
             end
         end
@@ -145,7 +168,7 @@ function cvxreg_qp_ineq_APG_ls(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Arra
             λ_new .= λ_x;
             λ_y .= λ_x;
         end
-        if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL))
+        if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL)  && k >= min_steps)
             break
         end
         θ_new = (1+sqrt(1+4*θ^2))/2;
@@ -167,39 +190,70 @@ end
 
 function cvxreg_qp_ineq_APG_ls_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, 
         lamb::LambdaActiveSet, L::T, n::Int64, d::Int64, phi_tmp::Array{T,1}, xi_tmp::Array{T,1}; 
-        β_1 = 0.9, β_2 = 0.98, max_steps=1000::Int64, TOL=1e-4::T, maxls = 20::Int64, start_time = 0., end_time = Inf) where T<:AbstractFloat
+        β_1 = 0.8, β_2 = 0.95, max_steps=1000::Int64, min_steps=0::Int64, TOL=1e-4::T, maxls = 20::Int64, 
+        L_init_estimate=:power, decrease_L = false, linesearch_type=:sufficient_decrease) where T<:AbstractFloat
     all_times = zeros(Float64,max_steps+1);
     cur_time = @elapsed begin 
         θ::Float64 = 1.0;
         θ_new::Float64 = 1.0;
         cur_ls = 0;
-        if L <= 0
-            L = power_iter(Xflat,I,J,Wlen,rho,n,d);
-            cur_ls = maxls;
-        end
         λ_x = copy(lamb.nzval);
         λ_y = copy(lamb.nzval);
         λ_new = zeros(eltype(Y),Wlen);
         s_tmp = zeros(eltype(Y),Wlen);
         grad = zeros(eltype(Y),Wlen);
         fnew = 0.;
+        grad_new = zeros(eltype(Y),Wlen);
+        f = 0.;
+        if L <= 0
+            if L_init_estimate == :power
+                L = power_iter(Xflat,I,J,Wlen,rho,n,d);
+                f = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+                cur_ls = maxls;
+            else
+                f = get_objective_value_gradient!(grad, Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+                λ_new = min.(λ_y - grad,0);
+                fnew = get_objective_value_gradient!(grad_new, Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
+                L = norm(grad_new.-grad,2)/norm(λ_new-λ_y,2);
+            end
+        else
+            f = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
+        end
+        ls_flag = false;
         objs = zeros(Float64,max_steps+1);
         f_evals = zeros(Float64,max_steps);
         Ls = zeros(Float64,max_steps);
-        f = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_x,n, d, phi_tmp, xi_tmp, s_tmp);
         k = 0;
         iter = 0;
         objs[1] = f;
-        status = 0;
     end
     all_times[1] = cur_time;
     for k in 1:max_steps
         cur_time += @elapsed begin
             get_gradient_evaluation!(grad, Xflat,Y,rho,I,J, Wlen, λ_y,n,d, phi_tmp, xi_tmp);
+            if decrease_L
+                L *= ((k==1) ? β_1 : β_2);
+            end
             while (true)
                 λ_new .= min.(λ_y - grad/L,0);
-                fnew = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
-                if cur_ls >= maxls || fnew <= f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2
+                if linesearch_type == :sufficient_decrease
+                    fnew = get_objective_value(Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
+                else
+                    fnew = get_objective_value_gradient!(grad_new, Xflat,Y,rho,I,J, Wlen, λ_new,n, d, phi_tmp, xi_tmp, s_tmp);
+                end
+#                 println(L," ", f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2-fnew, " ", L/2 * norm(λ_new - λ_y,2)^2 -abs(dot(λ_new - λ_y, grad_new - grad)))
+                if cur_ls >= maxls
+                    ls_flag = true
+                elseif linesearch_type == :sufficient_decrease 
+                    ls_flag = (fnew <= f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2)
+                elseif linesearch_type == :inner_product_condition
+                    if abs(fnew - f) > 0.001*max(abs(fnew), abs(f), 1) 
+                        ls_flag = (fnew <= f + dot(grad, λ_new - λ_y) + L/2 * norm(λ_new - λ_y,2)^2)
+                    else
+                        ls_flag = (abs(dot(λ_new - λ_y, grad_new - grad)) <= L/2 * norm(λ_new - λ_y,2)^2)
+                    end
+                end
+                if ls_flag
                     f_evals[k] = cur_ls+1;
                     cur_ls = 0
                     break
@@ -208,9 +262,6 @@ function cvxreg_qp_ineq_APG_ls_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::
                     cur_ls += 1
                     if cur_ls >= maxls
                         L = power_iter(Xflat,I,J,Wlen,rho,n,d,maxiter=50);
-                        f_evals[k] = cur_ls+1;
-                        cur_ls = 0;
-                        break
                     end
                 end
             end
@@ -225,8 +276,7 @@ function cvxreg_qp_ineq_APG_ls_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::
                 λ_new .= λ_x;
                 λ_y .= λ_x;
             end
-            if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL))
-                status = 1;
+            if (fnew <= f && fnew - f >-TOL && fnew>f*(1+TOL)  && k >= min_steps)
                 break
             end
             θ_new = (1+sqrt(1+4*θ^2))/2;
@@ -236,18 +286,13 @@ function cvxreg_qp_ineq_APG_ls_profiling(Xflat::Array{T,1}, Y::Array{T,1}, rho::
             θ = θ_new;
             f = fnew;
         end
-        if start_time + cur_time >= end_time
-            println("early stopping during optimization due to time limit")
-            status = -1
-            break
-        end
     end
     lamb.nzval .= λ_new
     phi_tmp .+= Y
     phi_tmp .*= -1
     xi_tmp .*= -1
     
-    return status, L, fnew, all_times[1:iter+1], objs[1:iter+1], f_evals[1:iter], Ls[1:iter], iter
+    return L, fnew, all_times[1:iter+1], objs[1:iter+1], f_evals[1:iter], Ls[1:iter], iter
 end
 
 function cvxreg_qp_ineq_LBFGS(Xflat::Array{T,1}, Y::Array{T,1}, rho::T, I::Array{Int64,1}, J::Array{Int64,1}, Wlen::Int64, 
